@@ -368,13 +368,18 @@ static void render(GB_gameboy_t *gb)
     /* TODO: only measured on one DMG (CPU revision unconfirmed);
        DAC timing is assumed shared by all pre-CGB models. */
     bool delay_dac = !GB_is_cgb(gb) && gb->apu_output.max_cycles_per_sample != 1;
+    if (unlikely(gb->apu_output.dac_step_sample_rate != gb->apu_output.sample_rate)) {
+        gb->apu_output.dac_step_sample_rate = gb->apu_output.sample_rate;
+        gb->apu_output.dac_decay_step = ((double) DAC_DECAY_SPEED) / gb->apu_output.sample_rate;
+        gb->apu_output.dac_attack_step = ((double) DAC_ATTACK_SPEED) / gb->apu_output.sample_rate;
+    }
 
     unrolled for (unsigned i = 0; i < GB_N_CHANNELS; i++) {
         double multiplier = CH_STEP;
         
         if (gb->model <= GB_MODEL_CGB_E) {
             if (!GB_apu_is_DAC_enabled(gb, i)) {
-                gb->apu_output.dac_discharge[i] -= ((double) DAC_DECAY_SPEED) / gb->apu_output.sample_rate;
+                gb->apu_output.dac_discharge[i] -= gb->apu_output.dac_decay_step;
                 if (gb->apu_output.dac_discharge[i] < 0) {
                     multiplier = 0;
                     gb->apu_output.dac_discharge[i] = 0;
@@ -384,7 +389,7 @@ static void render(GB_gameboy_t *gb)
                 }
             }
             else {
-                gb->apu_output.dac_discharge[i] += ((double) DAC_ATTACK_SPEED) / gb->apu_output.sample_rate;
+                gb->apu_output.dac_discharge[i] += gb->apu_output.dac_attack_step;
                 if (gb->apu_output.dac_discharge[i] > 1) {
                     gb->apu_output.dac_discharge[i] = 1;
                 }

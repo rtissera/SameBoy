@@ -203,6 +203,10 @@ typedef struct {
     
     GB_band_limited_t band_limited[GB_N_CHANNELS];
     double dac_discharge[GB_N_CHANNELS];
+    /* Per-sample DAC charge/discharge steps, cached so render() does not perform four
+       double divisions per output sample; recomputed whenever sample_rate changes */
+    unsigned dac_step_sample_rate;
+    double dac_attack_step, dac_decay_step;
     struct {
         uint8_t multiplier[GB_N_CHANNELS];
         uint8_t enabled;
