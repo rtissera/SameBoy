@@ -1000,11 +1000,15 @@ void GB_apu_run(GB_gameboy_t *gb, bool force)
 restart:;
     uint16_t cycles = gb->apu.apu_cycles;
 
+    /* Per-cycle stepping is only required while the wave channel is pulsed but inactive
+       (or a bugged read is pending): that path samples the CPU address bus every cycle.
+       While the wave channel is actively playing its state advances identically in batches
+       (as it already does on AGB), and every access to wave state syncs the APU first. */
     if (force ||
         (cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
         (gb->apu_output.sample_cycles >= clock_rate) ||
         (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
-        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)))) {
+        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && !gb->apu.is_active[GB_WAVE])))) {
         force = true;
     }
     if (!force) {

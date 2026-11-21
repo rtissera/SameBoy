@@ -509,7 +509,7 @@ static inline void apu_run(GB_gameboy_t *gb)
     if ((cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
         (gb->apu_output.sample_cycles >= GB_get_clock_rate(gb)) ||
         (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
-        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)))) {
+        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && !gb->apu.is_active[GB_WAVE])))) {
         GB_apu_run(gb, false);
     }
 }
