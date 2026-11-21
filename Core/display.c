@@ -351,12 +351,40 @@ static inline uint8_t scale_channel_with_curve_sgb(uint8_t x)
     return inline_const(uint8_t[], {0,2,5,9,15,20,27,34,42,50,58,67,76,85,94,104,114,123,133,143,153,163,173,182,192,202,211,220,229,238,247,255})[x];
 }
 
+/* Gamma-correct green/blue mixing used by the CGB/AGB color correction modes. It only
+   depends on the model family, the gamma and the two 5-bit inputs, so it is precomputed
+   once (same expression, so results are bit-identical) instead of calling pow() three
+   times per palette write, which games doing palette effects do constantly.
+   Indexed [agb][gamma == 2.2][g5][b5]. Filled before main() runs, so it is thread-safe. */
+static uint8_t green_mix_lut[2][2][32][32];
+
+static void __attribute__((constructor)) green_mix_lut_init(void)
+{
+    nounroll for (unsigned agb = 0; agb < 2; agb++) {
+        nounroll for (unsigned gamma_index = 0; gamma_index < 2; gamma_index++) {
+            double gamma = gamma_index? 2.2 : 1.6;
+            nounroll for (unsigned g5 = 0; g5 < 32; g5++) {
+                nounroll for (unsigned b5 = 0; b5 < 32; b5++) {
+                    uint8_t g = agb? scale_channel_with_curve_agb(g5) : scale_channel_with_curve(g5);
+                    uint8_t b = agb? scale_channel_with_curve_agb(b5) : scale_channel_with_curve(b5);
+                    if (agb) {
+                        green_mix_lut[agb][gamma_index][g5][b5] = round(pow((pow(g / 255.0, gamma) * 5 + pow(b / 255.0, gamma)) / 6, 1 / gamma) * 255);
+                    }
+                    else {
+                        green_mix_lut[agb][gamma_index][g5][b5] = round(pow((pow(g / 255.0, gamma) * 3 + pow(b / 255.0, gamma)) / 4, 1 / gamma) * 255);
+                    }
+                }
+            }
+        }
+    }
+}
 
 uint32_t GB_convert_rgb15(GB_gameboy_t *gb, uint16_t color, bool for_border)
 {
     uint8_t r = (color) & 0x1F;
     uint8_t g = (color >> 5) & 0x1F;
     uint8_t b = (color >> 10) & 0x1F;
+    const uint8_t g5 = g, b5 = b;
     
     if (gb->color_correction_mode == GB_COLOR_CORRECTION_DISABLED || (for_border && !gb->has_sgb_border)) {
         r = scale_channel(r);
@@ -377,20 +405,10 @@ uint32_t GB_convert_rgb15(GB_gameboy_t *gb, uint16_t color, bool for_border)
         if (gb->color_correction_mode != GB_COLOR_CORRECTION_CORRECT_CURVES) {
             uint8_t new_r, new_g, new_b;
             if (g != b) { // Minor optimization
-                double gamma = 2.2;
-                if (gb->color_correction_mode < GB_COLOR_CORRECTION_REDUCE_CONTRAST) {
-                    /* Don't use absolutely gamma-correct mixing for the high-contrast
-                       modes, to prevent the blue hues from being too washed out */
-                    gamma = 1.6;
-                }
-                
-                // TODO: Optimze pow out using a LUT
-                if (agb) {
-                    new_g = round(pow((pow(g / 255.0, gamma) * 5 + pow(b / 255.0, gamma)) / 6, 1 / gamma) * 255);
-                }
-                else {
-                    new_g = round(pow((pow(g / 255.0, gamma) * 3 + pow(b / 255.0, gamma)) / 4, 1 / gamma) * 255);
-                }
+                /* Don't use absolutely gamma-correct mixing (gamma 2.2) for the high-contrast
+                   modes, to prevent the blue hues from being too washed out (gamma 1.6) */
+                bool gamma_2_2 = !(gb->color_correction_mode < GB_COLOR_CORRECTION_REDUCE_CONTRAST);
+                new_g = green_mix_lut[agb][gamma_2_2][g5][b5];
             }
             else {
                 new_g = g;
