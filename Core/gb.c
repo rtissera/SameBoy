@@ -1405,7 +1405,7 @@ bool GB_is_inited(GB_gameboy_t *gb)
     return gb->magic == GB_state_magic();
 }
 
-bool GB_is_cgb(const GB_gameboy_t *gb)
+bool (GB_is_cgb)(const GB_gameboy_t *gb)
 {
     return gb->model >= GB_MODEL_CGB_0;
 }
@@ -1415,12 +1415,12 @@ bool GB_is_cgb_in_cgb_mode(GB_gameboy_t *gb)
     return gb->cgb_mode;
 }
 
-bool GB_is_sgb(GB_gameboy_t *gb)
+bool (GB_is_sgb)(GB_gameboy_t *gb)
 {
     return (gb->model & ~GB_MODEL_PAL_BIT & ~GB_MODEL_NO_SFC_BIT) == GB_MODEL_SGB || (gb->model & ~GB_MODEL_NO_SFC_BIT) == GB_MODEL_SGB2;
 }
 
-bool GB_is_hle_sgb(GB_gameboy_t *gb)
+bool (GB_is_hle_sgb)(GB_gameboy_t *gb)
 {
     return (gb->model & ~GB_MODEL_PAL_BIT) == GB_MODEL_SGB || gb->model == GB_MODEL_SGB2;
 }
@@ -1922,12 +1922,12 @@ void GB_set_clock_multiplier(GB_gameboy_t *gb, double multiplier)
     }
 }
 
-uint32_t GB_get_clock_rate(GB_gameboy_t *gb)
+uint32_t (GB_get_clock_rate)(GB_gameboy_t *gb)
 {
     return gb->clock_rate;
 }
 
-uint32_t GB_get_unmultiplied_clock_rate(GB_gameboy_t *gb)
+uint32_t (GB_get_unmultiplied_clock_rate)(GB_gameboy_t *gb)
 {
     return gb->unmultiplied_clock_rate;
 }

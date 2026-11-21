@@ -1050,6 +1050,41 @@ internal void GB_clear_running_thread(GB_gameboy_t *gb);
 #define GB_clear_running_thread(gb)
 #endif
     
+
+/* Inline fast paths of hot public accessors for core-internal callers (the
+   exported out-of-line versions in gb.c keep the public ABI). Defining the
+   functions in gb.c with parenthesized names prevents macro expansion. */
+static inline bool GB_is_cgb_inline(const GB_gameboy_t *gb)
+{
+    return gb->model >= GB_MODEL_CGB_0;
+}
+
+static inline bool GB_is_sgb_inline(const GB_gameboy_t *gb)
+{
+    return (gb->model & ~GB_MODEL_PAL_BIT & ~GB_MODEL_NO_SFC_BIT) == GB_MODEL_SGB || (gb->model & ~GB_MODEL_NO_SFC_BIT) == GB_MODEL_SGB2;
+}
+
+static inline bool GB_is_hle_sgb_inline(const GB_gameboy_t *gb)
+{
+    return (gb->model & ~GB_MODEL_PAL_BIT) == GB_MODEL_SGB || gb->model == GB_MODEL_SGB2;
+}
+
+static inline uint32_t GB_get_clock_rate_inline(const GB_gameboy_t *gb)
+{
+    return gb->clock_rate;
+}
+
+static inline uint32_t GB_get_unmultiplied_clock_rate_inline(const GB_gameboy_t *gb)
+{
+    return gb->unmultiplied_clock_rate;
+}
+
+#define GB_is_cgb(gb) GB_is_cgb_inline(gb)
+#define GB_is_sgb(gb) GB_is_sgb_inline(gb)
+#define GB_is_hle_sgb(gb) GB_is_hle_sgb_inline(gb)
+#define GB_get_clock_rate(gb) GB_get_clock_rate_inline(gb)
+#define GB_get_unmultiplied_clock_rate(gb) GB_get_unmultiplied_clock_rate_inline(gb)
+
 #endif
 
 #ifdef __cplusplus

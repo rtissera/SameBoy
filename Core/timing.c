@@ -147,6 +147,13 @@ static void ir_run(GB_gameboy_t *gb, uint32_t cycles)
                        (gb->cartridge_type->mbc_type == GB_HUC1 && gb->huc1.ir_mode) ||
                        (gb->cartridge_type->mbc_type == GB_HUC3 && gb->huc3.mode == 0xE);
     
+    if (likely(!is_sensing && gb->ir_warmup == 0 && gb->ir_decay == 0)) {
+        /* Steady state: both counters would stay clamped at 0 and the input is forced low.
+           Equivalent to the full computation below, without the work. */
+        gb->effective_ir_input = false;
+        return;
+    }
+    
     bool input = (gb->infrared_input || gb->cart_ir || (gb->io_registers[GB_IO_RP] & 1));
     if (is_sensing) {
         gb->ir_warmup += cycles;
@@ -268,7 +275,7 @@ void GB_serial_master_edge(GB_gameboy_t *gb)
 }
 
 
-void GB_set_internal_div_counter(GB_gameboy_t *gb, uint16_t value)
+static inline void set_internal_div_counter(GB_gameboy_t *gb, uint16_t value)
 {
     /* TIMA increases when a specific high-bit becomes a low-bit. */
     uint16_t triggers = gb->div_counter & ~value;
@@ -294,6 +301,11 @@ void GB_set_internal_div_counter(GB_gameboy_t *gb, uint16_t value)
     gb->div_counter = value;
 }
 
+void GB_set_internal_div_counter(GB_gameboy_t *gb, uint16_t value)
+{
+    set_internal_div_counter(gb, value);
+}
+
 static void timers_run(GB_gameboy_t *gb, uint8_t cycles)
 {
     if (gb->stopped) {
@@ -312,7 +324,7 @@ static void timers_run(GB_gameboy_t *gb, uint8_t cycles)
     GB_SLEEP(gb, div, 1, 3);
     while (true) {
         advance_tima_state_machine(gb);
-        GB_set_internal_div_counter(gb, gb->div_counter + 4);
+        set_internal_div_counter(gb, gb->div_counter + 4);
         gb->apu.apu_cycles += 1 << !gb->cgb_double_speed;
         gb->apu_output.sample_cycles += (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
         GB_SLEEP(gb, div, 2, 4);
@@ -469,6 +481,39 @@ static void camera_run(GB_gameboy_t *gb, uint8_t cycles)
 }
 
 
+/* Inline guards replicating the callees' own early-return conditions, so the common
+   "nothing to do" case doesn't pay for a call and a full prologue on every M-cycle. */
+static inline void joypad_run(GB_gameboy_t *gb, unsigned cycles)
+{
+    if (likely(gb->joypad_is_stable && !gb->inputs_changed)) return;
+    GB_joypad_run(gb, cycles);
+}
+
+static inline void dma_run(GB_gameboy_t *gb)
+{
+    /* Mirrors GB_dma_run's own early returns */
+    if (likely(gb->dma_current_dest == 0xA1 || gb->halted)) return;
+    GB_dma_run(gb);
+}
+
+static inline void apu_vgm_advance(GB_gameboy_t *gb, uint8_t cycles)
+{
+    if (likely(!gb->apu_output.output_file)) return;
+    GB_apu_vgm_advance(gb, cycles);
+}
+
+static inline void apu_run(GB_gameboy_t *gb)
+{
+    /* Same condition as the non-forced early return at the top of GB_apu_run */
+    uint16_t cycles = gb->apu.apu_cycles;
+    if ((cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
+        (gb->apu_output.sample_cycles >= GB_get_clock_rate(gb)) ||
+        (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
+        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)))) {
+        GB_apu_run(gb, false);
+    }
+}
+
 void GB_advance_cycles(GB_gameboy_t *gb, uint8_t cycles)
 {
     if (unlikely(gb->speed_switch_countdown)) {
@@ -535,7 +580,7 @@ void GB_advance_cycles(GB_gameboy_t *gb, uint8_t cycles)
     }
     gb->cycles_since_last_sync += cycles;
     gb->cycles_since_run += cycles;
-    GB_apu_vgm_advance(gb, cycles);
+    apu_vgm_advance(gb, cycles);
     
     gb->rumble_on_cycles += gb->rumble_strength & 3;
     gb->rumble_off_cycles += (gb->rumble_strength & 3) ^ 3;
@@ -550,11 +595,11 @@ void GB_advance_cycles(GB_gameboy_t *gb, uint8_t cycles)
         }
     }
     
-    GB_joypad_run(gb, cycles);
-    GB_apu_run(gb, false);
+    joypad_run(gb, cycles);
+    apu_run(gb);
     GB_display_run(gb, cycles, false);
     if (unlikely(!gb->stopped)) { // TODO: Verify what happens in STOP mode
-        GB_dma_run(gb);
+        dma_run(gb);
     }
     ir_run(gb, cycles);
     rtc_run(gb, cycles);
