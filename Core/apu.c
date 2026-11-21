@@ -9,6 +9,17 @@
 /* Band limited synthesis loosely based on: http://www.slack.net/~ant/bl-synth/ */
 static int32_t band_limited_steps[GB_BAND_LIMITED_PHASES][GB_BAND_LIMITED_WIDTH];
 
+/* SIMD path for band_limited_update, using GCC/Clang generic vector extensions so the
+   same code compiles to NEON (ARM32/AArch64), SSE2 (x86) or RVV, and falls back to scalar
+   code on targets without SIMD. All arithmetic is int32, so results are bit-identical to
+   the scalar loop. Each vector covers 2 taps: {L0, R0, L1, R1}. */
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(GB_DISABLE_BAND_LIMITED_SIMD)
+#define GB_BAND_LIMITED_SIMD
+typedef int32_t band_limited_vec_t __attribute__((vector_size(16), aligned(4), may_alias));
+/* Same coefficients as band_limited_steps, each duplicated for the left and right lanes */
+static int32_t band_limited_steps_lr[GB_BAND_LIMITED_PHASES][GB_BAND_LIMITED_WIDTH * 2] __attribute__((aligned(16)));
+#endif
+
 static void __attribute__((constructor)) band_limited_init(void)
 {
     const unsigned master_size = GB_BAND_LIMITED_WIDTH * GB_BAND_LIMITED_PHASES;
@@ -51,6 +62,11 @@ static void __attribute__((constructor)) band_limited_init(void)
         
         // Make sure the deltas sum to 1.0
         band_limited_steps[phase][GB_BAND_LIMITED_WIDTH / 2] += error;
+#ifdef GB_BAND_LIMITED_SIMD
+        nounroll for (signed i = 0; i < GB_BAND_LIMITED_WIDTH; i++) {
+            band_limited_steps_lr[phase][i * 2] = band_limited_steps_lr[phase][i * 2 + 1] = band_limited_steps[phase][i];
+        }
+#endif
     }
     free(master);
 }
@@ -69,11 +85,38 @@ static void band_limited_update(GB_band_limited_t *band_limited, const GB_sample
     };
     band_limited->input.packed = input->packed;
     
+#ifdef GB_BAND_LIMITED_SIMD
+    /* The 64 taps form at most two contiguous runs in the 128-entry ring buffer */
+    const unsigned buffer_size = sizeof(band_limited->buffer) / sizeof(band_limited->buffer[0]);
+    const int32_t *steps = band_limited_steps_lr[phase];
+    const band_limited_vec_t vdelta = {delta.left, delta.right, delta.left, delta.right};
+    unsigned i = 0;
+    while (i < GB_BAND_LIMITED_WIDTH) {
+        unsigned offset = (i + band_limited->pos + delay) & (buffer_size - 1);
+        unsigned count = buffer_size - offset;
+        if (count > GB_BAND_LIMITED_WIDTH - i) {
+            count = GB_BAND_LIMITED_WIDTH - i;
+        }
+        int32_t *dest = &band_limited->buffer[offset].left;
+        const int32_t *src = steps + i * 2;
+        unsigned j = 0;
+        for (; j + 2 <= count; j += 2) {
+            *(band_limited_vec_t *)(dest + j * 2) += vdelta * *(const band_limited_vec_t *)(src + j * 2);
+        }
+        if (j < count) {
+            dest[j * 2] += delta.left * src[j * 2];
+            dest[j * 2 + 1] += delta.right * src[j * 2 + 1];
+            j++;
+        }
+        i += count;
+    }
+#else
     for (unsigned i = 0; i < GB_BAND_LIMITED_WIDTH; i++) {
         unsigned offset = (i + band_limited->pos + delay) & (sizeof(band_limited->buffer) / sizeof(band_limited->buffer[0]) - 1);
         band_limited->buffer[offset].left += delta.left * band_limited_steps[phase][i];
         band_limited->buffer[offset].right += delta.right * band_limited_steps[phase][i];
     }
+#endif
 }
 
 static void band_limited_update_unfiltered(GB_band_limited_t *band_limited, const GB_sample_t *input, unsigned delay)
