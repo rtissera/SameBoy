@@ -1530,7 +1530,44 @@ static void update_frame_parity(GB_gameboy_t *gb)
  TODO: It seems that the STAT register's mode bits are always "late" by 4 T-cycles.
        The PPU logic can be greatly simplified if that delay is simply emulated.
  */
+static void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force);
+
+/* Fast path for calls that would only advance the free-running counters: the PPU
+   state machine is either sleeping (GB_SLEEP not expired) or waiting at the mode 2 or
+   mode 3 GB_BATCHPOINT for enough cycles to batch. In those cases display_run_full
+   performs exactly these updates and returns; doing them here avoids its large
+   prologue and dispatch, which run on every M-cycle (~80% of calls are trivial). */
 void GB_display_run(GB_gameboy_t *gb, unsigned cycles, bool force)
+{
+    if (likely(!force)) {
+        int32_t new_display_cycles = gb->display_cycles + cycles;
+        if ((new_display_cycles <= 0 ||
+             (gb->display_state == 3 && new_display_cycles < gb->mode3_batching_length * 2) ||
+             (gb->display_state == 5 && new_display_cycles < 80 * 2)) &&
+            (gb->wy_triggered || !gb->wy_check_scheduled) &&
+            !((gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) && (signed)(gb->cycles_for_line * 2 + cycles + gb->display_cycles) > LINE_LENGTH * 2) &&
+            !(gb->delayed_glitch_hblank_interrupt && cycles && gb->current_line < LINES) &&
+            !(gb->stopped && !GB_is_cgb(gb))) {
+            if (gb->wy_triggered) {
+                gb->wy_check_scheduled = false;
+            }
+            gb->cycles_since_vblank_callback += cycles / 2;
+            gb->frame_parity_ticks += cycles;
+            gb->wy_check_modulo += cycles;
+            if (cycles < gb->frame_repeat_countdown) {
+                gb->frame_repeat_countdown -= cycles;
+            }
+            else {
+                gb->frame_repeat_countdown = 0;
+            }
+            gb->display_cycles = new_display_cycles;
+            return;
+        }
+    }
+    display_run_full(gb, cycles, force);
+}
+
+static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force)
 {
     if (gb->wy_triggered) {
         gb->wy_check_scheduled = false;
