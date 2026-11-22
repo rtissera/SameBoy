@@ -160,7 +160,7 @@ static inline void lazy_sync(GB_gameboy_t *gb, unsigned cycles, uint16_t addr)
     if (gb->lazy_cpu_enabled && lazy_address_is_private(gb, addr)) {
         if (!cycles) return;
         if (!gb->lazy_deferred_cycles) {
-            gb->lazy_budget_cycles = GB_lazy_cpu_allowed(gb)? GB_LAZY_MAX_LAG : 0;
+            gb->lazy_budget_cycles = GB_lazy_cpu_budget(gb, GB_LAZY_MAX_LAG);
         }
         if (gb->lazy_deferred_cycles + cycles <= gb->lazy_budget_cycles) {
             gb->lazy_deferred_cycles += cycles;

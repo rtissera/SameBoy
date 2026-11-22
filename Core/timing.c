@@ -780,6 +780,50 @@ bool GB_lazy_cpu_allowed(GB_gameboy_t *gb)
     return true;
 }
 
+/* How many CPU cycles (max_lag at most) the CPU may run ahead of the rest of the machine.
+   Deferred cycles are applied exactly before any observable access, so the lag is only
+   visible as interrupt latency. VBlank and timer handlers tolerate it (a few dozen
+   microseconds), but STAT interrupts drive HBlank VRAM copies and raster effects that must
+   fit in their mode: while one is armed, the window ends before it can be raised. */
+unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
+{
+    if (!GB_lazy_cpu_allowed(gb)) return 0;
+    unsigned budget = max_lag;
+    uint8_t ie = gb->interrupt_enable;
+    uint8_t stat = gb->io_registers[GB_IO_STAT];
+    if ((ie & 3) && (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE)) {
+        /* Mode 0 / mode 2 STAT sources fire on every line, but only right after mode 3 /
+           mode 0: from any other mode they are more than GB_LAZY_MAX_LAG cycles away */
+        bool near = (ie & 2) && (((stat & 0x08) && (stat & 3) == 3) || ((stat & 0x20) && (stat & 3) == 0));
+        if (!near) {
+            /* VBlank, STAT mode 1 and LYC fire at the start of a given line: only bound the
+               window when that line is close */
+            unsigned ly = gb->current_line;
+            unsigned lines = 154;
+            if ((ie & 1) || ((ie & 2) && (stat & 0x10))) {
+                lines = (144 + 154 - ly) % 154;
+            }
+            if ((ie & 2) && (stat & 0x40) && gb->io_registers[GB_IO_LYC] < 154) {
+                lines = MIN(lines, (gb->io_registers[GB_IO_LYC] + 154 - ly) % 154);
+            }
+            if (lines <= 1) {
+                near = true;
+            }
+            else {
+                budget = MIN(budget, ((lines - 1) * 456) << gb->cgb_double_speed);
+            }
+        }
+        if (near) {
+            int32_t display = GB_display_trivial_budget(gb); /* GB_advance_cycles units */
+            if (display <= 0) return 0;
+            budget = MIN(budget, (unsigned)display >> !gb->cgb_double_speed);
+        }
+    }
+    /* Serial: only an internally clocked transfer can complete (and interrupt) on its own */
+    if ((ie & 8) && (gb->io_registers[GB_IO_SC] & 0x81) == 0x81) return 0;
+    return budget & ~3;
+}
+
 /* Number of M-cycles that can be advanced in one GB_advance_cycles call while keeping the
    units exact relative to each other: never more than GB_LAZY_CHUNK (so the PPU crosses at
    most one line boundary per call), and ending exactly where the APU guard would fire or

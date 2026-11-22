@@ -17,6 +17,7 @@ void GB_set_rtc_multiplier(GB_gameboy_t *gb, double multiplier);
 internal void GB_advance_cycles(GB_gameboy_t *gb, unsigned cycles);
 internal unsigned GB_halt_batch_iterations(GB_gameboy_t *gb);
 internal bool GB_lazy_cpu_allowed(GB_gameboy_t *gb);
+internal unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag);
 internal void GB_advance_cycles_chunked(GB_gameboy_t *gb, unsigned cycles, unsigned steps);
 internal void GB_halt_batch(GB_gameboy_t *gb, unsigned iterations);
 internal void GB_emulate_timer_glitch(GB_gameboy_t *gb, uint8_t old_tac, uint8_t new_tac);
