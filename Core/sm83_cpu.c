@@ -90,8 +90,8 @@ static const conflict_t sgb_conflict_map[0x80] = {
    detected in time since IF can only gain an enabled bit at such an event. */
 static inline bool lazy_cart_is_plain(GB_gameboy_t *gb)
 {
+    /* The MBC3 RTC counts seconds: a lag of at most GB_LAZY_MAX_LAG CPU cycles is not observable */
     const GB_cartridge_t *cart = gb->cartridge_type;
-    if (cart->has_rtc) return false;
     switch (cart->mbc_type) {
         case GB_NO_MBC:
         case GB_MBC1:
