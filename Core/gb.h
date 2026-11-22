@@ -1106,13 +1106,14 @@ static inline bool GB_apu_needs_run(const GB_gameboy_t *gb, unsigned apu_cycles,
     return (apu_cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
            (sample_cycles >= gb->clock_rate) ||
            (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
-           /* Per-cycle stepping is only required while the wave channel is pulsed but inactive
-              (or a bugged read is pending): that path samples the CPU address bus every cycle.
-              While the wave channel is actively playing its state advances identically in
-              batches (as it already does on AGB), and every access to wave state syncs the APU
-              first. (Lazy wave: not bit-exact, see the commit message.) */
+           /* Exact mode steps the APU every cycle while the wave channel is pulsed, as upstream
+              does: the inactive path samples the CPU address bus every cycle, and batching an
+              active channel would move band-limited sample phases (renders split at
+              max_cycles_per_sample land before the pending cycles are accounted). Relaxed mode
+              (lazy CPU) batches both: same emulated state and video, audio phase differs
+              transiently around edges, and the silent channel's bus read is taken per batch. */
            (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown ||
-            (!gb->lazy_cpu_enabled && gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && !gb->apu.is_active[GB_WAVE])));
+            (!gb->lazy_cpu_enabled && gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)));
 }
 
 internal void GB_cpu_lazy_flush(GB_gameboy_t *gb);
