@@ -1693,6 +1693,35 @@ static void update_frame_parity(GB_gameboy_t *gb)
  */
 static void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force);
 
+/* Relaxed accuracy: the current line's mode 3 was rendered in one go when it started, so a
+   register write landing inside it would only show on the next line. Called (after
+   GB_display_sync, before the write) when the CPU is about to change a register that
+   affects rendering: rewind the line to its mode 3 start state and replay the elapsed
+   cycles with the exact pixel FIFO, which then renders the rest of the line normally. */
+void GB_display_relaxed_mode3_write(GB_gameboy_t *gb)
+{
+    gb->relaxed_mode3_pending = false;
+    if (gb->display_state != 4 || gb->display_cycles > 0) return;
+    int32_t elapsed = gb->display_cycles + gb->mode3_batching_length * 2;
+    if (elapsed < 0) return;
+    gb->cycles_for_line -= gb->mode3_batching_length;
+    gb->n_visible_objs = gb->orig_n_visible_objs;
+    gb->window_y = gb->relaxed_mode3_window_y;
+    gb->disable_window_pixel_insertion_glitch = false;
+    fifo_clear(&gb->bg_fifo);
+    fifo_clear(&gb->oam_fifo);
+    fifo_push_bg_row(&gb->bg_fifo, 0, 0, 0, false, false);
+    gb->lcd_x = 0;
+    gb->position_in_line = -16;
+    gb->fetcher_state = GB_FETCHER_GET_TILE_T1;
+    gb->display_state = 46;
+    /* Already accounted for by the frame counters: run the state machine only */
+    gb->display_cycles = elapsed;
+    if (elapsed) {
+        display_run_full(gb, 0, true);
+    }
+}
+
 /* Largest cycle count for which GB_display_run(gb, cycles, false) would only advance the
    free-running counters: the PPU state machine is sleeping (GB_SLEEP not expired) or
    waiting at the mode 2 / mode 3 GB_BATCHPOINT, and no special condition (WY check, line
@@ -1882,6 +1911,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
         GB_STATE(gb, display, 43);
         GB_STATE(gb, display, 44);
         GB_STATE(gb, display, 45);
+        GB_STATE(gb, display, 46);
     }
     
     gb->wy_check_modulo = cycles;
@@ -2110,6 +2140,8 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             /* The actual rendering cycle */
             gb->fetcher_state = GB_FETCHER_GET_TILE_T1;
             if (gb->lazy_cpu_enabled && (gb->mode3_batching_length = mode3_relaxed_length(gb))) {
+                gb->relaxed_mode3_pending = true;
+                gb->relaxed_mode3_window_y = gb->window_y;
                 goto mode3_render_batched;
             }
             if ((gb->mode3_batching_length = mode3_batching_length(gb))) {
@@ -2129,6 +2161,9 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
                     goto skip_slow_mode_3;
                 }
             }
+            /* Entry point of GB_display_relaxed_mode3_write: the line restarts here from the
+               mode 3 start state and catches up cycle by cycle */
+        display46:;
             while (true) {
                 /* Handle window */
                 /* TODO: It appears that WX checks if the window begins *next* pixel, not *this* pixel. For this reason,
@@ -2301,6 +2336,7 @@ abort_fetching_object:
                 }
             }
 skip_slow_mode_3:
+            gb->relaxed_mode3_pending = false;
             gb->position_in_line = -16;
             gb->line_has_fractional_scrolling = false;
             

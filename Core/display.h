@@ -49,6 +49,7 @@ internal void GB_lcd_off(GB_gameboy_t *gb);
 internal void GB_display_vblank(GB_gameboy_t *gb, GB_vblank_type_t type);
 internal void GB_update_wx_glitch(GB_gameboy_t *gb);
 internal void GB_update_dmg_palette(GB_gameboy_t *gb);
+internal void GB_display_relaxed_mode3_write(GB_gameboy_t *gb);
 #define GB_display_sync(gb) GB_display_run(gb, 0, true)
 
 enum {

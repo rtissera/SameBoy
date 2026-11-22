@@ -848,6 +848,10 @@ struct GB_gameboy_internal_s {
         unsigned lazy_deferred_steps;
         unsigned lazy_budget_cycles;
         unsigned lazy_bus_mark; /* lazy_deferred_cycles when the data bus was last set */
+        /* Relaxed mode 3 rendered ahead, replayable exactly on a mid-line register write
+           (GB_display_relaxed_mode3_write) */
+        bool relaxed_mode3_pending;
+        uint8_t relaxed_mode3_window_y;
         unsigned cycles_since_run; // How many cycles have passed since the last call to GB_run(), in 8MHz units
         double clock_multiplier;
         GB_rumble_mode_t rumble_mode;
