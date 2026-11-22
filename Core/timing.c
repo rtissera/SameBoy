@@ -199,6 +199,22 @@ static void ir_run(GB_gameboy_t *gb, uint32_t cycles)
     gb->effective_ir_input = input;
 }
 
+/* Whether ir_run over many cycles at once gives the same state as over the same cycles
+   one by one. The noise is only consulted while the raw input is high, so with it low
+   (or forced low when not sensing) both counters move linearly and the output stays low;
+   with it high, warmup and decay both at their maximum are a fixed point (output low). */
+static __attribute__((__noinline__, __cold__)) bool ir_batch_safe(GB_gameboy_t *gb)
+{
+    const GB_cartridge_t *cart = gb->cartridge_type;
+    if ((gb->model > GB_MODEL_CGB_E || !gb->cgb_mode) && cart->mbc_type != GB_HUC1 && cart->mbc_type != GB_HUC3) return true;
+    bool is_sensing = (gb->io_registers[GB_IO_RP] & 0xC0) == 0xC0 ||
+                      (cart->mbc_type == GB_HUC1 && gb->huc1.ir_mode) ||
+                      (cart->mbc_type == GB_HUC3 && gb->huc3.mode == 0xE);
+    if (!is_sensing) return true;
+    if (!(gb->infrared_input || gb->cart_ir || (gb->io_registers[GB_IO_RP] & 1))) return true;
+    return gb->ir_warmup == IR_WARMUP_MAX && gb->ir_decay == IR_DECAY_MAX;
+}
+
 static void advance_tima_state_machine(GB_gameboy_t *gb)
 {
     if (gb->tima_reload_state == GB_TIMA_RELOADED) {
@@ -683,18 +699,19 @@ static unsigned event_budget(GB_gameboy_t *gb, bool halted)
     if (!gb->joypad_is_stable || gb->inputs_changed) return 0;
     if (gb->div_state != 2 || gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
     if (gb->apu.pending_envelope_tick) return 0;
-    /* Serial: an internally clocked transfer shifts on DIV edges and raises an interrupt.
-       An externally clocked one only advances on edges from a link partner (callbacks). */
-    if ((gb->io_registers[GB_IO_SC] & 0x81) == 0x81) return 0;
+    /* Serial: an internally clocked transfer shifts on DIV edges, which the deferred cycles
+       replay exactly (SB/SC reads sync first); its interrupt bounds the budget, see
+       GB_lazy_cpu_budget. An externally clocked one only advances on edges from a link
+       partner (callbacks). */
     if ((gb->io_registers[GB_IO_SC] & 0x80) && (gb->serial_transfer_bit_start_callback || gb->serial_transfer_bit_end_callback)) return 0;
     
     const GB_cartridge_t *cart = gb->cartridge_type;
-    /* IR: only its steady state (see ir_run) is a no-op */
+    /* IR: its steady state (see ir_run) is a no-op; otherwise see ir_batch_safe */
     if ((gb->model <= GB_MODEL_CGB_E && gb->cgb_mode) || cart->mbc_type == GB_HUC1 || cart->mbc_type == GB_HUC3) {
         bool is_sensing = (gb->io_registers[GB_IO_RP] & 0xC0) == 0xC0 ||
                           (cart->mbc_type == GB_HUC1 && gb->huc1.ir_mode) ||
                           (cart->mbc_type == GB_HUC3 && gb->huc3.mode == 0xE);
-        if (is_sensing || gb->ir_warmup || gb->ir_decay) return 0;
+        if ((is_sensing || gb->ir_warmup || gb->ir_decay) && !ir_batch_safe(gb)) return 0;
     }
     
     /* PPU: stay within the trivial (counters only) window; VBlank and STAT interrupts
@@ -820,7 +837,13 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
         }
     }
     /* Serial: only an internally clocked transfer can complete (and interrupt) on its own */
-    if ((ie & 8) && (gb->io_registers[GB_IO_SC] & 0x81) == 0x81) return 0;
+    if ((ie & 8) && (gb->io_registers[GB_IO_SC] & 0x81) == 0x81) {
+        /* The serial interrupt can only be raised on a serial clock edge (a DIV bit falling):
+           stop before the next one */
+        unsigned distance = div_edge_distance(gb->div_counter, (gb->serial_mask & -gb->serial_mask) * 2);
+        if (distance <= 8) return 0;
+        budget = MIN(budget, distance - 8);
+    }
     return budget & ~3;
 }
 
@@ -850,7 +873,7 @@ static unsigned lazy_chunk_limit(GB_gameboy_t *gb)
         bool is_sensing = (gb->io_registers[GB_IO_RP] & 0xC0) == 0xC0 ||
                           (cart->mbc_type == GB_HUC1 && gb->huc1.ir_mode) ||
                           (cart->mbc_type == GB_HUC3 && gb->huc3.mode == 0xE);
-        if (is_sensing || gb->ir_warmup || gb->ir_decay) return 1;
+        if ((is_sensing || gb->ir_warmup || gb->ir_decay) && !ir_batch_safe(gb)) return 1;
     }
     if (gb->div_state != 2 || gb->apu.pending_envelope_tick) return 1;
     return MAX(limit, 1);
