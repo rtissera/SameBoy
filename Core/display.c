@@ -1658,9 +1658,38 @@ static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
         length += 6;
     }
     if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_OBJ_EN) {
-        for (unsigned i = 0; i < gb->n_visible_objs; i++) {
-            uint8_t x = gb->oam[gb->visible_objs[i] * 4 + 1];
-            length += 11 - MIN(5, (x + scx) & 7);
+        /* Object penalty (Pan Docs): 6 dots per object, plus a wait for the background
+           fetcher of 5 - (position within the tile) dots that only the first object of a
+           given tile column pays. Columns follow the SCX alignment, then the window's once
+           it started. Objects at X >= 168 are never fetched. objects_x is sorted by
+           decreasing X. */
+        unsigned window_x = window? gb->io_registers[GB_IO_WX] + 1 : 0x100;
+        unsigned prev_column = ~0u;
+        bool in_window = false;
+        for (unsigned i = gb->n_visible_objs; i--;) {
+            unsigned x = gb->objects_x[i];
+            if (x >= 168) continue;
+            unsigned rel;
+            if (x >= window_x) {
+                if (!in_window) {
+                    in_window = true;
+                    prev_column = ~0u;
+                }
+                rel = x - window_x;
+            }
+            else {
+                rel = x + scx;
+            }
+            unsigned column = rel & ~7u;
+            unsigned penalty = 6;
+            if (x == 0) {
+                penalty = 11;
+            }
+            else if ((rel & 7) < 5 && column != prev_column) {
+                penalty = 11 - (rel & 7);
+            }
+            prev_column = column;
+            length += penalty;
         }
     }
     return MIN(length, 289);
