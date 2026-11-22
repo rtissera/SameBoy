@@ -261,6 +261,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
         },
         "rumble-enabled games"
     },
+    {
+        "sameboy_timing_accuracy",
+        "System - Timing Accuracy",
+        "Timing Accuracy",
+        "Exact emulates every component cycle by cycle. Fast lets the CPU run ahead of the other components and renders each scanline in one go, which is several times cheaper but not cycle-exact: mid-scanline raster effects and some timing-sensitive test ROMs are not reproduced.",
+        NULL,
+        "system",
+        {
+            { "exact", "Exact" },
+            { "fast",  "Fast"  },
+            { NULL, NULL },
+        },
+        "exact"
+    },
 
     /* Core options used in dual cart mode */
 

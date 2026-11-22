@@ -1523,6 +1523,45 @@ static inline uint16_t mode3_batching_length(GB_gameboy_t *gb)
     return 0;
 }
 
+/* Relaxed accuracy (lazy CPU mode): mode 3 is always rendered in one go by render_line
+   when it starts, with a length estimated from SCX, the visible objects and the window
+   instead of the exact pixel FIFO timing. Mid-line register writes are not visible on
+   the current line, and the HBlank start is approximate. */
+static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
+{
+    if (gb->position_in_line != (uint8_t)-16) return 0;
+    if (gb->model & GB_MODEL_NO_SFC_BIT) return 0;
+    if (gb->hdma_on) return 0;
+    if (gb->stopped) return 0;
+    if (GB_is_dma_active(gb)) return 0;
+    if (gb->wx_triggered) return 0;
+    bool window = gb->wy_triggered && (gb->io_registers[GB_IO_LCDC] & GB_LCDC_WIN_ENABLE);
+    if (gb->wy_triggered) {
+        if (window) {
+            if ((gb->io_registers[GB_IO_WX] < 7 || gb->io_registers[GB_IO_WX] == 166 || gb->io_registers[GB_IO_WX] == 167)) {
+                return 0;
+            }
+        }
+        else {
+            if (gb->io_registers[GB_IO_WX] < 167 && !GB_is_cgb(gb)) {
+                return 0;
+            }
+        }
+    }
+    uint8_t scx = gb->io_registers[GB_IO_SCX];
+    unsigned length = 167 + (scx & 7);
+    if (window) {
+        length += 6;
+    }
+    if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_OBJ_EN) {
+        for (unsigned i = 0; i < gb->n_visible_objs; i++) {
+            uint8_t x = gb->oam[gb->visible_objs[i] * 4 + 1];
+            length += 11 - MIN(5, (x + scx) & 7);
+        }
+    }
+    return MIN(length, 289);
+}
+
 static inline uint8_t x_for_object_match(GB_gameboy_t *gb)
 {
     uint8_t ret = gb->position_in_line + 8;
@@ -1949,10 +1988,14 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             
             /* The actual rendering cycle */
             gb->fetcher_state = GB_FETCHER_GET_TILE_T1;
+            if (gb->lazy_cpu_enabled && (gb->mode3_batching_length = mode3_relaxed_length(gb))) {
+                goto mode3_render_batched;
+            }
             if ((gb->mode3_batching_length = mode3_batching_length(gb))) {
                 GB_BATCHPOINT(gb, display, 3, gb->mode3_batching_length);
                 if (GB_BATCHED_CYCLES(gb, display) >= gb->mode3_batching_length) {
                     // Successfully batched!
+                mode3_render_batched:
                     gb->lcd_x = gb->position_in_line = 160;
                     gb->cycles_for_line += gb->mode3_batching_length;
                     if (gb->sgb) {

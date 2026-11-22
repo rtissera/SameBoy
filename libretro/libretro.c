@@ -412,7 +412,8 @@ static void set_variable_visibility(void)
             (strcmp(key, "sameboy_border")                  == 0) ||
             (strcmp(key, "sameboy_high_pass_filter_mode")   == 0) ||
             (strcmp(key, "sameboy_audio_interference")      == 0) ||
-            (strcmp(key, "sameboy_rumble")                  == 0)) {
+            (strcmp(key, "sameboy_rumble")                  == 0) ||
+            (strcmp(key, "sameboy_timing_accuracy")         == 0)) {
             option_display_singlecart.key = key;
             environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display_singlecart);
         }
@@ -962,6 +963,12 @@ static void check_variables()
         var.value = NULL;
         if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
             GB_set_interference_volume(&gameboy[0], atoi(var.value) / 100.0);
+        }
+
+        var.key = "sameboy_timing_accuracy";
+        var.value = NULL;
+        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+            GB_set_lazy_cpu(&gameboy[0], strcmp(var.value, "fast") == 0);
         }
 
         var.key = "sameboy_rumble";
