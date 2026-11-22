@@ -126,7 +126,23 @@ static void lazy_flush(GB_gameboy_t *gb, unsigned cycles)
     unsigned steps = gb->lazy_deferred_steps + (cycles? 1 : 0);
     gb->lazy_deferred_cycles = 0;
     gb->lazy_deferred_steps = 0;
+    /* Open bus decay: only the cycles after the data bus was last set apply to it */
+    uint8_t data_bus = gb->data_bus;
+    unsigned decay = gb->data_bus_decay_countdown;
+    unsigned elapsed = total - gb->lazy_bus_mark;
+    gb->lazy_bus_mark = 0;
     GB_advance_cycles_chunked(gb, total, steps);
+    if (decay) {
+        if (!gb->cgb_double_speed) elapsed <<= 1;
+        if (decay > elapsed) {
+            gb->data_bus = data_bus;
+            gb->data_bus_decay_countdown = decay - elapsed;
+        }
+        else {
+            gb->data_bus = 0xFF;
+            gb->data_bus_decay_countdown = 0;
+        }
+    }
 }
 
 void GB_cpu_lazy_flush(GB_gameboy_t *gb)

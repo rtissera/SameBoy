@@ -336,6 +336,18 @@ static uint8_t read_vram(GB_gameboy_t *gb, uint16_t addr)
     return gb->cpu_vram_bus = gb->vram[(addr & 0x1FFF) + (gb->cgb_vram_bank? 0x2000 : 0)];
 }
 
+/* The data bus value an open bus read sees. With deferred (lazy) CPU cycles, the decay for the
+   cycles elapsed since the bus was last set has not been applied yet. */
+static uint8_t open_bus_value(GB_gameboy_t *gb)
+{
+    if (likely(gb->lazy_deferred_cycles <= gb->lazy_bus_mark || !gb->data_bus_decay_countdown)) {
+        return gb->data_bus;
+    }
+    unsigned elapsed = gb->lazy_deferred_cycles - gb->lazy_bus_mark;
+    if (!gb->cgb_double_speed) elapsed <<= 1;
+    return elapsed >= gb->data_bus_decay_countdown? 0xFF : gb->data_bus;
+}
+
 static uint8_t read_mbc7_ram(GB_gameboy_t *gb, uint16_t addr)
 {
     if (!gb->mbc_ram_enable || !gb->mbc7.secondary_ram_enable) return 0xFF;
@@ -395,7 +407,7 @@ static uint8_t read_mbc_ram(GB_gameboy_t *gb, uint16_t addr)
                 return gb->rtc_latched.data[(addr & 3) ^ 3];
             default:
                 gb->returned_open_bus = true;
-                return gb->data_bus;
+                return open_bus_value(gb);
         }
     }
     else if ((!gb->mbc_ram_enable) &&
@@ -403,7 +415,7 @@ static uint8_t read_mbc_ram(GB_gameboy_t *gb, uint16_t addr)
         gb->cartridge_type->mbc_type != GB_HUC1 &&
         gb->cartridge_type->mbc_type != GB_HUC3) {
         gb->returned_open_bus = true;
-        return gb->data_bus;
+        return open_bus_value(gb);
     }
     
     if (gb->cartridge_type->mbc_type == GB_HUC1 && gb->huc1.ir_mode) {
@@ -421,7 +433,7 @@ static uint8_t read_mbc_ram(GB_gameboy_t *gb, uint16_t addr)
             return gb->rtc_latched.data[gb->mbc_ram_bank];
         }
         gb->returned_open_bus = true;
-        return gb->data_bus;
+        return open_bus_value(gb);
     }
 
     if (gb->camera_registers_mapped) {
@@ -430,7 +442,7 @@ static uint8_t read_mbc_ram(GB_gameboy_t *gb, uint16_t addr)
 
     if (!gb->mbc_ram || !gb->mbc_ram_size) {
         gb->returned_open_bus = true;
-        return gb->data_bus;
+        return open_bus_value(gb);
     }
 
     if (gb->cartridge_type->mbc_type == GB_CAMERA) {
@@ -815,6 +827,7 @@ uint8_t GB_read_memory(GB_gameboy_t *gb, uint16_t addr)
         else {
             gb->data_bus = data;
             gb->data_bus_decay_countdown = gb->data_bus_decay;
+            gb->lazy_bus_mark = gb->lazy_deferred_cycles;
         }
     }
     return data;
@@ -1829,6 +1842,7 @@ void GB_write_memory(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
     if (bus_for_addr(gb, addr) == GB_BUS_MAIN && addr < 0xFF00) {
         gb->data_bus = value;
         gb->data_bus_decay_countdown = gb->data_bus_decay;
+        gb->lazy_bus_mark = gb->lazy_deferred_cycles;
     }
     
     if (unlikely(gb->write_memory_callback)) {

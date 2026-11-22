@@ -847,6 +847,7 @@ struct GB_gameboy_internal_s {
         unsigned lazy_deferred_cycles;
         unsigned lazy_deferred_steps;
         unsigned lazy_budget_cycles;
+        unsigned lazy_bus_mark; /* lazy_deferred_cycles when the data bus was last set */
         unsigned cycles_since_run; // How many cycles have passed since the last call to GB_run(), in 8MHz units
         double clock_multiplier;
         GB_rumble_mode_t rumble_mode;
@@ -1136,6 +1137,7 @@ static inline uint8_t GB_read_memory_fast(GB_gameboy_t *gb, uint16_t addr)
         else {
             gb->data_bus = data;
             gb->data_bus_decay_countdown = gb->data_bus_decay;
+            gb->lazy_bus_mark = gb->lazy_deferred_cycles;
         }
         return data;
     }

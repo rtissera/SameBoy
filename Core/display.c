@@ -1777,6 +1777,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
         GB_STATE(gb, display, 42);
         GB_STATE(gb, display, 43);
         GB_STATE(gb, display, 44);
+        GB_STATE(gb, display, 45);
     }
     
     gb->wy_check_modulo = cycles;
@@ -1944,11 +1945,13 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
                 }
                 gb->oam_search_index = 40;
                 gb->accessed_oam_row = -1;
+                /* Keep the access blocking timeline of the stepped scan (unblocks after entry 37) */
+                GB_SLEEP(gb, display, 44, 76);
                 gb->vram_read_blocked = !GB_is_cgb(gb);
                 gb->vram_write_blocked = false;
                 gb->cgb_palettes_blocked = false;
                 gb->oam_write_blocked = GB_is_cgb(gb);
-                GB_SLEEP(gb, display, 44, 80);
+                GB_SLEEP(gb, display, 45, 4);
                 goto oam_scan_done;
             }
             if (!GB_is_dma_active(gb) && !gb->oam_ppu_blocked) {
