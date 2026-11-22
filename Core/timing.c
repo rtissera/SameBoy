@@ -219,7 +219,7 @@ static void increase_tima(GB_gameboy_t *gb)
     }
 }
 
-static void printer_run(GB_gameboy_t *gb, uint8_t cycles)
+static void printer_run(GB_gameboy_t *gb, unsigned cycles)
 {
     if (gb->printer_callback || gb->printer_done_callback || gb->accessory == GB_ACCESSORY_PRINTER) {
         gb->printer.cycle_counter += cycles;
@@ -306,7 +306,7 @@ void GB_set_internal_div_counter(GB_gameboy_t *gb, uint16_t value)
     set_internal_div_counter(gb, value);
 }
 
-static void timers_run(GB_gameboy_t *gb, uint8_t cycles)
+static void timers_run(GB_gameboy_t *gb, unsigned cycles)
 {
     if (gb->stopped) {
         if (GB_is_cgb(gb)) {
@@ -429,7 +429,7 @@ void GB_rtc_set_time(GB_gameboy_t *gb, uint64_t current_time)
     }
 }
 
-static void rtc_run(GB_gameboy_t *gb, uint8_t cycles)
+static void rtc_run(GB_gameboy_t *gb, unsigned cycles)
 {
     if (likely(gb->cartridge_type->mbc_type != GB_HUC3 && !gb->cartridge_type->has_rtc)) return;
     gb->rtc_cycles += cycles;
@@ -457,7 +457,7 @@ static void rtc_run(GB_gameboy_t *gb, uint8_t cycles)
     GB_rtc_set_time(gb, current_time);
 }
 
-static void camera_run(GB_gameboy_t *gb, uint8_t cycles)
+static void camera_run(GB_gameboy_t *gb, unsigned cycles)
 {
     /* Do we have a camera? */
     if (likely(gb->cartridge_type->mbc_type != GB_CAMERA)) return;
@@ -496,7 +496,7 @@ static inline void dma_run(GB_gameboy_t *gb)
     GB_dma_run(gb);
 }
 
-static inline void apu_vgm_advance(GB_gameboy_t *gb, uint8_t cycles)
+static inline void apu_vgm_advance(GB_gameboy_t *gb, unsigned cycles)
 {
     if (likely(!gb->apu_output.output_file)) return;
     GB_apu_vgm_advance(gb, cycles);
@@ -505,16 +505,12 @@ static inline void apu_vgm_advance(GB_gameboy_t *gb, uint8_t cycles)
 static inline void apu_run(GB_gameboy_t *gb)
 {
     /* Same condition as the non-forced early return at the top of GB_apu_run */
-    uint16_t cycles = gb->apu.apu_cycles;
-    if ((cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
-        (gb->apu_output.sample_cycles >= GB_get_clock_rate(gb)) ||
-        (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
-        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)))) {
+    if (GB_apu_needs_run(gb, gb->apu.apu_cycles, gb->apu_output.sample_cycles)) {
         GB_apu_run(gb, false);
     }
 }
 
-void GB_advance_cycles(GB_gameboy_t *gb, uint8_t cycles)
+void GB_advance_cycles(GB_gameboy_t *gb, unsigned cycles)
 {
     if (unlikely(gb->speed_switch_countdown)) {
         if (gb->speed_switch_countdown == cycles) {
@@ -603,6 +599,198 @@ void GB_advance_cycles(GB_gameboy_t *gb, uint8_t cycles)
     }
     ir_run(gb, cycles);
     rtc_run(gb, cycles);
+}
+
+/* HALT batching
+   While the CPU is halted, every M-cycle runs the same loop iteration in GB_cpu_run:
+   two GB_advance_cycles(2) with an interrupt check in between on pre-CGB models, a single
+   GB_advance_cycles(4) on CGB. As long as no enabled interrupt can be raised and no unit
+   needs per-step work, a run of such iterations only advances counters, and a single
+   GB_advance_cycles call with the total count produces the same state (every unit handles
+   multi-cycle advances: the timers loop per M-cycle, the PPU takes its trivial path, the
+   APU guard does not fire). GB_halt_batch_iterations returns how many iterations are
+   guaranteed to be like that, every bound being conservative; GB_halt_batch performs them.
+   Builds with GB_HALT_VERIFY replay the iterations one by one on a copy and compare. */
+
+#define GB_HALT_BATCH_MAX 60
+
+unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
+{
+#ifndef GB_DISABLE_DEBUGGER
+    return 0; /* The debugger hooks every GB_run call */
+#endif
+    if (!gb->halt_batching_allowed) return 0;
+    if (!gb->halted || gb->just_halted || gb->stopped) return 0;
+    /* Most frequent blockers first: an APU run due within one M-cycle (always the case
+       while the wave channel forces per-cycle APU runs), or a non-trivial PPU step */
+    const unsigned apu_step = 1 << !gb->cgb_double_speed;
+    const unsigned sample_step = (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
+    if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step, gb->apu_output.sample_cycles + sample_step)) return 0;
+    /* GB_advance_cycles units per iteration (4 CPU cycles, doubled when not in double speed) */
+    const unsigned units = gb->cgb_double_speed? 4 : 8;
+    int32_t display_budget = GB_display_trivial_budget(gb);
+    if (display_budget < (int32_t)(2 * units)) return 0; /* Not worth it below 2 iterations */
+
+    if (gb->ime_toggle || gb->pending_cycles) return 0;
+    if (gb->interrupt_enable & gb->io_registers[GB_IO_IF] & 0x1F) return 0;
+    if (gb->speed_switch_countdown || gb->speed_switch_halt_countdown || gb->speed_switch_freeze) return 0;
+    if (gb->printer_callback || gb->printer_done_callback || gb->accessory == GB_ACCESSORY_PRINTER) return 0;
+    if (gb->apu_output.output_file) return 0;
+    if (!gb->joypad_is_stable || gb->inputs_changed) return 0;
+    if (gb->div_state != 2 || gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
+    if (gb->apu.pending_envelope_tick) return 0;
+    if (gb->io_registers[GB_IO_SC] & 0x80) return 0; /* Serial transfer in progress */
+    
+    const GB_cartridge_t *cart = gb->cartridge_type;
+    /* IR: only its steady state (see ir_run) is a no-op */
+    if ((gb->model <= GB_MODEL_CGB_E && gb->cgb_mode) || cart->mbc_type == GB_HUC1 || cart->mbc_type == GB_HUC3) {
+        bool is_sensing = (gb->io_registers[GB_IO_RP] & 0xC0) == 0xC0 ||
+                          (cart->mbc_type == GB_HUC1 && gb->huc1.ir_mode) ||
+                          (cart->mbc_type == GB_HUC3 && gb->huc3.mode == 0xE);
+        if (is_sensing || gb->ir_warmup || gb->ir_decay) return 0;
+    }
+    
+    /* PPU: stay within the trivial (counters only) window; VBlank and STAT interrupts
+       can only be raised outside of it */
+    unsigned n = MIN(GB_HALT_BATCH_MAX, (unsigned)display_budget / units);
+    
+    /* DIV-APU events (both edges of the APU bit) force APU runs: stop before the next one.
+       The DIV counter advances by 4 per M-cycle. */
+    uint16_t apu_bit = gb->cgb_double_speed? 0x2000 : 0x1000;
+    unsigned to_apu_edge = (apu_bit - (gb->div_counter & (apu_bit - 1)) + 3) / 4; /* M-cycle of the edge */
+    n = MIN(n, to_apu_edge - 1);
+    if (!n) return 0;
+    
+    /* Timer interrupt: stop before the M-cycle TIMA overflows (IF is set one M-cycle later) */
+    if ((gb->interrupt_enable & 4) && (gb->io_registers[GB_IO_TAC] & 4)) {
+        unsigned period = TAC_TRIGGER_BITS[gb->io_registers[GB_IO_TAC] & 3] * 2;
+        unsigned first_increment = (period - (gb->div_counter & (period - 1)) + 3) / 4;
+        unsigned overflow = first_increment + (0xFF - gb->io_registers[GB_IO_TIMA]) * (period / 4);
+        n = MIN(n, overflow - 1);
+        if (!n) return 0;
+    }
+    
+    /* GB_timing_sync runs every iteration in this state; it must keep returning early */
+    if ((gb->interrupt_enable & 0x10)) {
+        if (gb->cycles_since_last_sync + units >= LCDC_PERIOD / 3) return 0;
+        n = MIN(n, (unsigned)((LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units));
+        if (!n) return 0;
+    }
+    
+    /* RTC: stay below the next second (or host sync) boundary */
+    if (cart->mbc_type == GB_HUC3 || cart->has_rtc) {
+        uint32_t limit = 0;
+        if (gb->rtc_mode == GB_RTC_MODE_SYNC_TO_HOST) {
+            limit = GB_get_unmultiplied_clock_rate(gb) / 16;
+        }
+        else if (cart->mbc_type == GB_HUC3 || !(gb->rtc_real.high & 0x40)) {
+            limit = unlikely(gb->rtc_second_length)? gb->rtc_second_length : GB_get_unmultiplied_clock_rate(gb) * 2;
+        }
+        if (limit) {
+            if (gb->rtc_cycles + units >= limit) return 0;
+            n = MIN(n, (limit - 1 - gb->rtc_cycles) / units);
+            if (!n) return 0;
+        }
+    }
+    
+    /* APU: no run may be triggered during the batch. The timers loop adds these per M-cycle;
+       the condition is monotonic in n, so search the largest n that keeps it false. */
+    if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step * n, gb->apu_output.sample_cycles + sample_step * n)) {
+        unsigned low = 1, high = n; /* needs_run(low) is false, needs_run(high) is true */
+        while (high - low > 1) {
+            unsigned mid = (low + high) / 2;
+            if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step * mid, gb->apu_output.sample_cycles + sample_step * mid)) {
+                high = mid;
+            }
+            else {
+                low = mid;
+            }
+        }
+        n = low;
+    }
+    return n;
+}
+
+static void halt_batch_apply(GB_gameboy_t *gb, unsigned iterations)
+{
+    bool pre_cgb = !GB_is_cgb(gb);
+    unsigned calls = pre_cgb? iterations * 2 : iterations;
+    GB_advance_cycles(gb, iterations * 4);
+    /* Per-call side effects of GB_advance_cycles */
+    gb->dma_cycles = pre_cgb? 2 : 4;
+    gb->rumble_on_cycles += (gb->rumble_strength & 3) * (calls - 1);
+    gb->rumble_off_cycles += ((gb->rumble_strength & 3) ^ 3) * (calls - 1);
+}
+
+#ifdef GB_HALT_VERIFY
+#include <stdlib.h>
+#include <string.h>
+static void halt_verify_trap(void)
+{
+    fprintf(stderr, "HALT batch verifier: a callback fired during a batch\n");
+    abort();
+}
+
+static void halt_batch_reference(GB_gameboy_t *gb, unsigned iterations)
+{
+    /* Exactly what GB_cpu_run does for each halted iteration that doesn't wake up */
+    for (unsigned i = 0; i < iterations; i++) {
+        if ((gb->interrupt_enable & 0x10) && (gb->ime || gb->halted)) {
+            GB_timing_sync(gb);
+        }
+        if (!GB_is_cgb(gb)) {
+            GB_advance_cycles(gb, 2);
+        }
+        if (gb->interrupt_enable & gb->io_registers[GB_IO_IF] & 0x1F) {
+            fprintf(stderr, "HALT batch verifier: interrupt pending inside the batch (iteration %u/%u)\n", i, iterations);
+            abort();
+        }
+        GB_advance_cycles(gb, GB_is_cgb(gb)? 4 : 2);
+        if (gb->interrupt_enable & gb->io_registers[GB_IO_IF] & 0x1F) {
+            fprintf(stderr, "HALT batch verifier: interrupt pending at the end of iteration %u/%u\n", i, iterations);
+            abort();
+        }
+    }
+}
+#endif
+
+void GB_halt_batch(GB_gameboy_t *gb, unsigned iterations)
+{
+#ifdef GB_HALT_VERIFY
+    GB_gameboy_t *reference = malloc(sizeof(*gb));
+    memcpy(reference, gb, sizeof(*gb));
+    /* Any callback firing during a batch is a failure */
+    reference->vblank_callback = (void *)halt_verify_trap;
+    reference->apu_output.sample_callback = (void *)halt_verify_trap;
+    reference->lcd_line_callback = (void *)halt_verify_trap;
+    reference->rumble_callback = (void *)halt_verify_trap;
+    reference->infrared_callback = (void *)halt_verify_trap;
+    reference->serial_transfer_bit_start_callback = (void *)halt_verify_trap;
+    reference->serial_transfer_bit_end_callback = (void *)halt_verify_trap;
+    halt_batch_reference(reference, iterations);
+    reference->vblank_callback = gb->vblank_callback;
+    reference->apu_output.sample_callback = gb->apu_output.sample_callback;
+    reference->lcd_line_callback = gb->lcd_line_callback;
+    reference->rumble_callback = gb->rumble_callback;
+    reference->infrared_callback = gb->infrared_callback;
+    reference->serial_transfer_bit_start_callback = gb->serial_transfer_bit_start_callback;
+    reference->serial_transfer_bit_end_callback = gb->serial_transfer_bit_end_callback;
+#endif
+    halt_batch_apply(gb, iterations);
+#ifdef GB_HALT_VERIFY
+    if (memcmp(reference, gb, sizeof(*gb))) {
+        const uint8_t *a = (const void *)reference, *b = (const void *)gb;
+        for (size_t i = 0; i < sizeof(*gb); i++) {
+            if (a[i] != b[i]) {
+                fprintf(stderr, "HALT batch verifier: state differs at offset %zu (reference %02x, batched %02x), %u iterations, %s, double speed %d\n",
+                        i, a[i], b[i], iterations, GB_is_cgb(gb)? "CGB" : "pre-CGB", gb->cgb_double_speed);
+                break;
+            }
+        }
+        abort();
+    }
+    free(reference);
+#endif
 }
 
 /* 

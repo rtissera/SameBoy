@@ -1618,6 +1618,14 @@ void GB_cpu_run(GB_gameboy_t *gb)
         return;
     }
     
+    if (gb->halted) {
+        /* Skip a run of halted M-cycles that provably only advance counters (see timing.c) */
+        unsigned iterations = GB_halt_batch_iterations(gb);
+        if (iterations) {
+            GB_halt_batch(gb, iterations);
+        }
+    }
+    
     if ((gb->interrupt_enable & 0x10) && (gb->ime || gb->halted)) {
         GB_timing_sync(gb);
     }

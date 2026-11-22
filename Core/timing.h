@@ -14,7 +14,9 @@ void GB_set_rtc_mode(GB_gameboy_t *gb, GB_rtc_mode_t mode);
 void GB_set_rtc_multiplier(GB_gameboy_t *gb, double multiplier);
 
 #ifdef GB_INTERNAL
-internal void GB_advance_cycles(GB_gameboy_t *gb, uint8_t cycles);
+internal void GB_advance_cycles(GB_gameboy_t *gb, unsigned cycles);
+internal unsigned GB_halt_batch_iterations(GB_gameboy_t *gb);
+internal void GB_halt_batch(GB_gameboy_t *gb, unsigned iterations);
 internal void GB_emulate_timer_glitch(GB_gameboy_t *gb, uint8_t old_tac, uint8_t new_tac);
 internal bool GB_timing_sync_turbo(GB_gameboy_t *gb); /* Returns true if should skip frame */
 internal void GB_timing_sync(GB_gameboy_t *gb);

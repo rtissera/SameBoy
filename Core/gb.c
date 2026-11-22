@@ -1239,12 +1239,14 @@ uint64_t GB_run_frame(GB_gameboy_t *gb)
     gb->turbo_cap_multiplier = 0;
     
     gb->cycles_since_last_sync = 0;
+    gb->halt_batching_allowed = true;
     while (true) {
         GB_run(gb);
         if (gb->vblank_just_occured) {
             break;
         }
     }
+    gb->halt_batching_allowed = false;
     gb->turbo = old_turbo;
     gb->turbo_dont_skip = old_dont_skip;
     gb->turbo_cap_multiplier = old_turbo_cap;

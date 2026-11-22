@@ -1000,11 +1000,7 @@ void GB_apu_run(GB_gameboy_t *gb, bool force)
 restart:;
     uint16_t cycles = gb->apu.apu_cycles;
 
-    if (force ||
-        (cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
-        (gb->apu_output.sample_cycles >= clock_rate) ||
-        (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
-        (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)))) {
+    if (force || GB_apu_needs_run(gb, cycles, gb->apu_output.sample_cycles)) {
         force = true;
     }
     if (!force) {
@@ -2610,7 +2606,7 @@ static bool vgm_write_apu_snapshot(GB_gameboy_t *gb)
     return true;
 }
 
-static void noinline vgm_advance(GB_gameboy_t *gb, uint8_t cycles)
+static void noinline vgm_advance(GB_gameboy_t *gb, unsigned cycles)
 {
     uint64_t clock_rate = (uint64_t)gb->apu_output.vgm_clock_rate * 2;
     if (!clock_rate) return;
@@ -2621,7 +2617,7 @@ static void noinline vgm_advance(GB_gameboy_t *gb, uint8_t cycles)
     gb->apu_output.vgm_total_samples += samples;
 }
 
-void GB_apu_vgm_advance(GB_gameboy_t *gb, uint8_t cycles)
+void GB_apu_vgm_advance(GB_gameboy_t *gb, unsigned cycles)
 {
     if (likely(!gb->apu_output.output_file)) return;
     if (likely(gb->apu_output.output_format != GB_AUDIO_FORMAT_VGM)) return;

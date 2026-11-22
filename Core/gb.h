@@ -841,6 +841,7 @@ struct GB_gameboy_internal_s {
         bool disable_rendering;
         uint8_t boot_rom[0x900];
         bool vblank_just_occured; // For slow operations involving syscalls; these should only run once per vblank
+        bool halt_batching_allowed; // Set while inside GB_run_frame, see GB_halt_batch_iterations
         unsigned cycles_since_run; // How many cycles have passed since the last call to GB_run(), in 8MHz units
         double clock_multiplier;
         GB_rumble_mode_t rumble_mode;
@@ -1077,6 +1078,17 @@ static inline uint32_t GB_get_clock_rate_inline(const GB_gameboy_t *gb)
 static inline uint32_t GB_get_unmultiplied_clock_rate_inline(const GB_gameboy_t *gb)
 {
     return gb->unmultiplied_clock_rate;
+}
+
+/* Whether GB_apu_run(gb, false) has to actually run the APU, given the pending APU cycles
+   and the sample cycle accumulator. Single source of truth for GB_apu_run itself, the
+   per-step guard in GB_advance_cycles and the HALT batching bound. */
+static inline bool GB_apu_needs_run(const GB_gameboy_t *gb, unsigned apu_cycles, unsigned sample_cycles)
+{
+    return (apu_cycles + gb->apu_output.cycles_since_render >= gb->apu_output.max_cycles_per_sample) ||
+           (sample_cycles >= gb->clock_rate) ||
+           (gb->apu.square_sweep_calculate_countdown || gb->apu.channel_1_restart_hold || gb->apu.square_sweep_calculate_countdown_reload_timer) ||
+           (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)));
 }
 
 #define GB_is_cgb(gb) GB_is_cgb_inline(gb)

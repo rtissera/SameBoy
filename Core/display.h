@@ -43,6 +43,7 @@ typedef struct {
 #ifdef GB_INTERNAL
 internal void GB_display_run(GB_gameboy_t *gb, unsigned cycles, bool force);
 internal void GB_palette_changed(GB_gameboy_t *gb, bool background_palette, uint8_t index);
+internal int32_t GB_display_trivial_budget(GB_gameboy_t *gb);
 internal void GB_STAT_update(GB_gameboy_t *gb);
 internal void GB_lcd_off(GB_gameboy_t *gb);
 internal void GB_display_vblank(GB_gameboy_t *gb, GB_vblank_type_t type);
