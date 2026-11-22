@@ -161,7 +161,7 @@ static uint8_t cycle_read(GB_gameboy_t *gb, uint16_t addr)
         lazy_sync(gb, gb->pending_cycles, addr);
     }
     gb->address_bus = addr;
-    uint8_t ret = GB_read_memory(gb, addr);
+    uint8_t ret = GB_read_memory_fast(gb, addr);
     gb->pending_cycles = 4;
     return ret;
 }
