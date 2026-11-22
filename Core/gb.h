@@ -1103,7 +1103,8 @@ static inline bool GB_apu_needs_run(const GB_gameboy_t *gb, unsigned apu_cycles,
               While the wave channel is actively playing its state advances identically in
               batches (as it already does on AGB), and every access to wave state syncs the APU
               first. (Lazy wave: not bit-exact, see the commit message.) */
-           (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && !gb->apu.is_active[GB_WAVE])));
+           (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown ||
+            (!gb->lazy_cpu_enabled && gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && !gb->apu.is_active[GB_WAVE])));
 }
 
 internal void GB_cpu_lazy_flush(GB_gameboy_t *gb);

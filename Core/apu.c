@@ -1189,7 +1189,7 @@ restart:;
             while (unlikely(cycles_left > gb->apu.wave_channel.sample_countdown)) {
                 cycles_left -= gb->apu.wave_channel.sample_countdown + 1;
                 gb->apu.wave_channel.sample_countdown = gb->apu.wave_channel.sample_length ^ 0x7FF;
-                if (cycles_left) {
+                if (cycles_left || gb->lazy_cpu_enabled) {
                     gb->apu.wave_channel.current_sample_byte = read_wave_sample_bus(gb);
                 }
                 else {
@@ -1199,7 +1199,9 @@ restart:;
             if (cycles_left) {
                 gb->apu.wave_channel.sample_countdown -= cycles_left;
             }
-            if (gb->apu.wave_channel.sample_countdown == 0) {
+            /* Relaxed mode (lazy CPU): the bus read of a silent channel is taken at batch
+               granularity instead of being stepped cycle by cycle */
+            if (gb->apu.wave_channel.sample_countdown == 0 && !gb->lazy_cpu_enabled) {
                 gb->apu.wave_channel.bugged_read_countdown = 2;
             }
         }

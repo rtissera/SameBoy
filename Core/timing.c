@@ -306,6 +306,12 @@ void GB_set_internal_div_counter(GB_gameboy_t *gb, uint16_t value)
     set_internal_div_counter(gb, value);
 }
 
+/* Number of DIV counts before the counter crosses a multiple of period (a power of 2) */
+static inline unsigned div_edge_distance(uint16_t counter, unsigned period)
+{
+    return period - (counter & (period - 1));
+}
+
 static void timers_run(GB_gameboy_t *gb, unsigned cycles)
 {
     if (gb->stopped) {
@@ -314,6 +320,32 @@ static void timers_run(GB_gameboy_t *gb, unsigned cycles)
         }
         gb->apu_output.sample_cycles += (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
         return;
+    }
+    
+    /* Multi-M-cycle advance in the steady loop: the M-cycles before the next DIV edge that
+       matters (a TIMA or serial clock falling edge, either edge of the DIV-APU bit) only
+       advance counters, so perform them in closed form. The loop below then runs the
+       remaining M-cycles (at least one) exactly as before. */
+    if (cycles > 4 && gb->div_state == 2 &&
+        gb->tima_reload_state == GB_TIMA_RUNNING && !gb->apu.pending_envelope_tick) {
+        int32_t total = gb->div_cycles + (int32_t)cycles;
+        if (total > 4) {
+            unsigned iterations = (total + 3) / 4;
+            unsigned distance = div_edge_distance(gb->div_counter, gb->cgb_double_speed? 0x2000 : 0x1000);
+            if (gb->io_registers[GB_IO_TAC] & 4) {
+                distance = MIN(distance, div_edge_distance(gb->div_counter, TAC_TRIGGER_BITS[gb->io_registers[GB_IO_TAC] & 3] * 2));
+            }
+            if (gb->serial_mask) {
+                distance = MIN(distance, div_edge_distance(gb->div_counter, (gb->serial_mask & -gb->serial_mask) * 2));
+            }
+            unsigned skip = MIN(MIN(iterations - 1, (cycles - 1) / 4), (distance - 1) / 4);
+            if (skip) {
+                gb->div_counter += skip * 4;
+                gb->apu.apu_cycles += skip << !gb->cgb_double_speed;
+                gb->apu_output.sample_cycles += skip * ((gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1);
+                cycles -= skip * 4;
+            }
+        }
     }
     
     GB_STATE_MACHINE(gb, div, cycles, 1) {
