@@ -12,12 +12,10 @@ static int32_t band_limited_steps[GB_BAND_LIMITED_PHASES][GB_BAND_LIMITED_WIDTH]
 /* SIMD path for band_limited_update, using GCC/Clang generic vector extensions so the
    same code compiles to NEON (ARM32/AArch64), SSE2 (x86) or RVV, and falls back to scalar
    code on targets without SIMD. All arithmetic is int32, so results are bit-identical to
-   the scalar loop. Each vector covers 2 taps: {L0, R0, L1, R1}. */
+   the scalar loop. Each vector covers 4 taps of the mono buffer. */
 #if (defined(__GNUC__) || defined(__clang__)) && !defined(GB_DISABLE_BAND_LIMITED_SIMD)
 #define GB_BAND_LIMITED_SIMD
 typedef int32_t band_limited_vec_t __attribute__((vector_size(16), aligned(4), may_alias));
-/* Same coefficients as band_limited_steps, each duplicated for the left and right lanes */
-static int32_t band_limited_steps_lr[GB_BAND_LIMITED_PHASES][GB_BAND_LIMITED_WIDTH * 2] __attribute__((aligned(16)));
 #endif
 
 static void __attribute__((constructor)) band_limited_init(void)
@@ -62,34 +60,79 @@ static void __attribute__((constructor)) band_limited_init(void)
         
         // Make sure the deltas sum to 1.0
         band_limited_steps[phase][GB_BAND_LIMITED_WIDTH / 2] += error;
-#ifdef GB_BAND_LIMITED_SIMD
-        nounroll for (signed i = 0; i < GB_BAND_LIMITED_WIDTH; i++) {
-            band_limited_steps_lr[phase][i * 2] = band_limited_steps_lr[phase][i * 2 + 1] = band_limited_steps[phase][i];
-        }
-#endif
     }
     free(master);
 }
 
-static void band_limited_update(GB_band_limited_t *band_limited, const GB_sample_t *input, unsigned phase)
+/* Moves the weighted mono part into the stereo buffer, so the weights can change */
+static void band_limited_bake_mono(GB_band_limited_t *band_limited, GB_band_limited_buffers_t *buffers)
+{
+    int32_t weight_left = band_limited->weight_left;
+    int32_t weight_right = band_limited->weight_right;
+    band_limited->output.left += weight_left * band_limited->mono_output;
+    band_limited->output.right += weight_right * band_limited->mono_output;
+    band_limited->mono_output = 0;
+    if (!band_limited->mono_live) return;
+    band_limited->mono_live = 0;
+    for (unsigned i = 0; i < sizeof(buffers->mono) / sizeof(buffers->mono[0]); i++) {
+        buffers->buffer[i].left += weight_left * buffers->mono[i];
+        buffers->buffer[i].right += weight_right * buffers->mono[i];
+        buffers->mono[i] = 0;
+    }
+}
+
+static unsigned gcd(unsigned a, unsigned b)
+{
+    while (b) {
+        unsigned t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+static void band_limited_update(GB_band_limited_t *band_limited, GB_band_limited_buffers_t *buffers, const GB_sample_t *input, unsigned phase)
 {
     if (input->packed == band_limited->input.packed) return;
     unsigned delay = phase / GB_BAND_LIMITED_PHASES;
     phase = phase & (GB_BAND_LIMITED_PHASES - 1);
     
-    struct {
-        signed left, right;
-    } delta = {
-        .left = input->left - band_limited->input.left,
-        .right = input->right - band_limited->input.right,
-    };
+    signed delta_left = input->left - band_limited->input.left;
+    signed delta_right = input->right - band_limited->input.right;
     band_limited->input.packed = input->packed;
     
+    /* Express the change as delta * (weight_left, weight_right) */
+    signed weight_left = band_limited->weight_left;
+    signed weight_right = band_limited->weight_right;
+    signed delta = 0;
+    bool fits = false;
+    if (weight_left) {
+        if (delta_left % weight_left == 0) {
+            delta = delta_left / weight_left;
+            fits = delta * weight_right == delta_right;
+        }
+    }
+    else if (weight_right && !delta_left && delta_right % weight_right == 0) {
+        delta = delta_right / weight_right;
+        fits = true;
+    }
+    if (unlikely(!fits)) {
+        /* New left/right ratio (both deltas can't be 0 here) */
+        band_limited_bake_mono(band_limited, buffers);
+        delta = gcd(abs(delta_left), abs(delta_right));
+        band_limited->weight_left = delta_left / delta;
+        band_limited->weight_right = delta_right / delta;
+    }
+    
+    if (band_limited->mono_live < delay + GB_BAND_LIMITED_WIDTH) {
+        band_limited->mono_live = delay + GB_BAND_LIMITED_WIDTH;
+    }
+    
+    const unsigned buffer_size = sizeof(buffers->mono) / sizeof(buffers->mono[0]);
+    const int32_t *steps = band_limited_steps[phase];
 #ifdef GB_BAND_LIMITED_SIMD
     /* The 64 taps form at most two contiguous runs in the 128-entry ring buffer */
-    const unsigned buffer_size = sizeof(band_limited->buffer) / sizeof(band_limited->buffer[0]);
-    const int32_t *steps = band_limited_steps_lr[phase];
-    const band_limited_vec_t vdelta = {delta.left, delta.right, delta.left, delta.right};
+    const band_limited_vec_t vdelta = {delta, delta, delta, delta};
     unsigned i = 0;
     while (i < GB_BAND_LIMITED_WIDTH) {
         unsigned offset = (i + band_limited->pos + delay) & (buffer_size - 1);
@@ -97,29 +140,26 @@ static void band_limited_update(GB_band_limited_t *band_limited, const GB_sample
         if (count > GB_BAND_LIMITED_WIDTH - i) {
             count = GB_BAND_LIMITED_WIDTH - i;
         }
-        int32_t *dest = &band_limited->buffer[offset].left;
-        const int32_t *src = steps + i * 2;
+        int32_t *dest = &buffers->mono[offset];
+        const int32_t *src = steps + i;
         unsigned j = 0;
-        for (; j + 2 <= count; j += 2) {
-            *(band_limited_vec_t *)(dest + j * 2) += vdelta * *(const band_limited_vec_t *)(src + j * 2);
+        for (; j + 4 <= count; j += 4) {
+            *(band_limited_vec_t *)(dest + j) += vdelta * *(const band_limited_vec_t *)(src + j);
         }
-        if (j < count) {
-            dest[j * 2] += delta.left * src[j * 2];
-            dest[j * 2 + 1] += delta.right * src[j * 2 + 1];
-            j++;
+        for (; j < count; j++) {
+            dest[j] += delta * src[j];
         }
         i += count;
     }
 #else
     for (unsigned i = 0; i < GB_BAND_LIMITED_WIDTH; i++) {
-        unsigned offset = (i + band_limited->pos + delay) & (sizeof(band_limited->buffer) / sizeof(band_limited->buffer[0]) - 1);
-        band_limited->buffer[offset].left += delta.left * band_limited_steps[phase][i];
-        band_limited->buffer[offset].right += delta.right * band_limited_steps[phase][i];
+        unsigned offset = (i + band_limited->pos + delay) & (buffer_size - 1);
+        buffers->mono[offset] += delta * steps[i];
     }
 #endif
 }
 
-static void band_limited_update_unfiltered(GB_band_limited_t *band_limited, const GB_sample_t *input, unsigned delay)
+static void band_limited_update_unfiltered(GB_band_limited_t *band_limited, GB_band_limited_buffers_t *buffers, const GB_sample_t *input, unsigned delay)
 {
     if (input->packed == band_limited->input.packed) return;
     
@@ -131,21 +171,28 @@ static void band_limited_update_unfiltered(GB_band_limited_t *band_limited, cons
     };
     band_limited->input.packed = input->packed;
     
-    unsigned offset = (band_limited->pos + delay) & (sizeof(band_limited->buffer) / sizeof(band_limited->buffer[0]) - 1);
-    band_limited->buffer[offset].left += delta.left * GB_BAND_LIMITED_ONE;
-    band_limited->buffer[offset].right += delta.right * GB_BAND_LIMITED_ONE;
+    unsigned offset = (band_limited->pos + delay) & (sizeof(buffers->buffer) / sizeof(buffers->buffer[0]) - 1);
+    buffers->buffer[offset].left += delta.left * GB_BAND_LIMITED_ONE;
+    buffers->buffer[offset].right += delta.right * GB_BAND_LIMITED_ONE;
 }
 
-static void band_limited_read(GB_band_limited_t *band_limited, GB_sample_t *output, uint32_t multiplier)
+static void band_limited_read(GB_band_limited_t *band_limited, GB_band_limited_buffers_t *buffers, GB_sample_t *output, uint32_t multiplier)
 {
-    band_limited->output.left += band_limited->buffer[band_limited->pos].left;
-    band_limited->output.right += band_limited->buffer[band_limited->pos].right;
+    band_limited->output.left += buffers->buffer[band_limited->pos].left;
+    band_limited->output.right += buffers->buffer[band_limited->pos].right;
+    band_limited->mono_output += buffers->mono[band_limited->pos];
     
-    band_limited->buffer[band_limited->pos].left = band_limited->buffer[band_limited->pos].right = 0;
-    band_limited->pos = (band_limited->pos + 1) & (sizeof(band_limited->buffer) / sizeof(band_limited->buffer[0]) - 1);
+    buffers->buffer[band_limited->pos].left = buffers->buffer[band_limited->pos].right = 0;
+    buffers->mono[band_limited->pos] = 0;
+    band_limited->pos = (band_limited->pos + 1) & (sizeof(buffers->buffer) / sizeof(buffers->buffer[0]) - 1);
+    if (band_limited->mono_live) {
+        band_limited->mono_live--;
+    }
     
-    output->left = band_limited->output.left * multiplier / GB_BAND_LIMITED_ONE;
-    output->right = band_limited->output.right * multiplier / GB_BAND_LIMITED_ONE;
+    int32_t left = band_limited->output.left + band_limited->weight_left * band_limited->mono_output;
+    int32_t right = band_limited->output.right + band_limited->weight_right * band_limited->mono_output;
+    output->left = left * multiplier / GB_BAND_LIMITED_ONE;
+    output->right = right * multiplier / GB_BAND_LIMITED_ONE;
     
     /* This hueristic will mute the channel if it's only playing an amplitude of 1 or 2 units, usually
        caused by rounding errors when the channel is playing a single frequency above Nyquist. */
@@ -251,10 +298,10 @@ static inline void emit_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sa
     }
 #endif
     if (unfiltered) {
-        band_limited_update_unfiltered(&gb->apu_output.band_limited[index], output, arg);
+        band_limited_update_unfiltered(&gb->apu_output.band_limited[index], &gb->band_limited_buffers[index], output, arg);
     }
     else {
-        band_limited_update(&gb->apu_output.band_limited[index], output, arg);
+        band_limited_update(&gb->apu_output.band_limited[index], &gb->band_limited_buffers[index], output, arg);
     }
 }
 
@@ -397,16 +444,22 @@ static void render_capture(GB_gameboy_t *gb, GB_render_job_t *job)
         
         if (gb->model <= GB_MODEL_CGB_E) {
             if (!GB_apu_is_DAC_enabled(gb, i)) {
-                gb->apu_output.dac_discharge[i] -= gb->apu_output.dac_decay_step;
-                if (gb->apu_output.dac_discharge[i] < 0) {
+                if (gb->apu_output.dac_discharge[i] == 0) {
+                    /* Fully discharged: same result as the general path, without the math */
                     multiplier = 0;
-                    gb->apu_output.dac_discharge[i] = 0;
                 }
                 else {
-                    multiplier *= smooth(gb->apu_output.dac_discharge[i]);
+                    gb->apu_output.dac_discharge[i] -= gb->apu_output.dac_decay_step;
+                    if (gb->apu_output.dac_discharge[i] < 0) {
+                        multiplier = 0;
+                        gb->apu_output.dac_discharge[i] = 0;
+                    }
+                    else {
+                        multiplier *= smooth(gb->apu_output.dac_discharge[i]);
+                    }
                 }
             }
-            else {
+            else if (gb->apu_output.dac_discharge[i] != 1) { /* Fully charged: multiplier stays CH_STEP */
                 gb->apu_output.dac_discharge[i] += gb->apu_output.dac_attack_step;
                 if (gb->apu_output.dac_discharge[i] > 1) {
                     gb->apu_output.dac_discharge[i] = 1;
@@ -475,7 +528,7 @@ static void render_process(GB_gameboy_t *gb, const GB_render_job_t *job)
     GB_sample_t output = {0, 0};
     unrolled for (unsigned i = 0; i < GB_N_CHANNELS; i++) {
         GB_sample_t channel_output;
-        band_limited_read(&gb->apu_output.band_limited[i], &channel_output, job->multiplier[i]);
+        band_limited_read(&gb->apu_output.band_limited[i], &gb->band_limited_buffers[i], &channel_output, job->multiplier[i]);
 
         output.left += channel_output.left;
         output.right += channel_output.right;
@@ -2921,7 +2974,7 @@ typedef struct {
     };
 } GB_audio_event_t;
 
-#define GB_AUDIO_PUBLISH_BATCH 32 /* Updates are published in batches; renders publish immediately */
+#define GB_AUDIO_PUBLISH_BATCH 32 /* Events are published in batches; GB_apu_flush_audio_thread publishes the rest */
 #define GB_CACHE_LINE 64
 
 struct GB_audio_thread_s {
@@ -2956,10 +3009,10 @@ static void process_audio_event(GB_gameboy_t *gb, const GB_audio_event_t *event)
 {
     switch ((GB_audio_event_type_t)event->type) {
         case GB_AUDIO_EVENT_UPDATE:
-            band_limited_update(&gb->apu_output.band_limited[event->update.index], &event->update.sample, event->update.arg);
+            band_limited_update(&gb->apu_output.band_limited[event->update.index], &gb->band_limited_buffers[event->update.index], &event->update.sample, event->update.arg);
             break;
         case GB_AUDIO_EVENT_UPDATE_UNFILTERED:
-            band_limited_update_unfiltered(&gb->apu_output.band_limited[event->update.index], &event->update.sample, event->update.arg);
+            band_limited_update_unfiltered(&gb->apu_output.band_limited[event->update.index], &gb->band_limited_buffers[event->update.index], &event->update.sample, event->update.arg);
             break;
         case GB_AUDIO_EVENT_RENDER:
             render_process(gb, &event->render);
@@ -3053,7 +3106,11 @@ static void audio_thread_push_render(GB_gameboy_t *gb, const GB_render_job_t *jo
     event->type = GB_AUDIO_EVENT_RENDER;
     event->render = *job;
     thread->producer_head++;
-    audio_thread_publish(thread);
+    /* Samples are only consumed after GB_apu_flush_audio_thread, so renders can be
+       published in batches too; this keeps the barrier and cache line traffic low */
+    if (++thread->unpublished >= GB_AUDIO_PUBLISH_BATCH) {
+        audio_thread_publish(thread);
+    }
 }
 
 void GB_apu_flush_audio_thread(GB_gameboy_t *gb)

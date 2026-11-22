@@ -869,6 +869,9 @@ struct GB_gameboy_internal_s {
         void *running_thread_id;
                
         GB_gbs_header_t gbs_header;
+        
+        /* Band limited synthesis ring buffers (see GB_band_limited_buffers_t) */
+        GB_band_limited_buffers_t band_limited_buffers[GB_N_CHANNELS];
    )
 };
     

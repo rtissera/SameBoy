@@ -181,10 +181,26 @@ typedef enum {
     GB_AUDIO_FORMAT_VGM,
 } GB_audio_format_t;
 
+/* The large ring buffers live at the end of GB_gameboy_t (band_limited_buffers) so they
+   don't push frequently used fields out of short load/store offset ranges */
 typedef struct {
     struct {
         int32_t left, right;
-    } buffer[GB_BAND_LIMITED_WIDTH * 2], output;
+    } buffer[GB_BAND_LIMITED_WIDTH * 2];
+    /* Channel level changes are almost always proportional to fixed left/right weights
+       (the panning and master volume rarely change), so they are synthesized once into a
+       mono buffer and weighted when read. Integer arithmetic keeps this bit-identical to
+       synthesizing both sides. buffer holds everything else. */
+    int32_t mono[GB_BAND_LIMITED_WIDTH * 2];
+} GB_band_limited_buffers_t;
+
+typedef struct {
+    struct {
+        int32_t left, right;
+    } output;
+    int32_t mono_output;
+    int16_t weight_left, weight_right;
+    uint8_t mono_live; /* Reads left until mono[] is all zeros */
     uint8_t pos;
     GB_sample_t input;
     GB_sample_t last_output;
