@@ -1091,6 +1091,41 @@ static inline bool GB_apu_needs_run(const GB_gameboy_t *gb, unsigned apu_cycles,
            (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed)));
 }
 
+/* CPU-side fast path of GB_read_memory for ROM and WRAM, the bulk of CPU reads: same
+   result and side effects as the full path when no OAM DMA is running (the only source of
+   bus conflicts for these regions), no read callback is set and the boot ROM is unmapped. */
+static inline uint8_t GB_read_memory_fast(GB_gameboy_t *gb, uint16_t addr)
+{
+#if defined(GB_DISABLE_DEBUGGER) && defined(GB_DISABLE_CHEATS)
+    if (likely(gb->dma_current_dest == 0xA1 && !gb->read_memory_callback)) {
+        uint8_t data;
+        if (addr < 0x8000) {
+            if (unlikely(!gb->boot_rom_finished || !gb->rom_size)) goto slow;
+            unsigned bank = (addr & 0x4000)? gb->mbc_rom_bank : gb->mbc_rom0_bank;
+            data = gb->rom[((addr & 0x3FFF) + bank * 0x4000) & (gb->rom_size - 1)];
+        }
+        else if (addr >= 0xC000 && addr < 0xE000) {
+            data = gb->ram[(addr & 0x0FFF) + ((addr & 0x1000)? gb->cgb_ram_bank * 0x1000 : 0)];
+            if (GB_is_cgb_inline(gb)) return data; /* WRAM is on its own bus */
+        }
+        else {
+            goto slow;
+        }
+        /* Main bus: same open bus bookkeeping as GB_read_memory */
+        if (unlikely(gb->returned_open_bus)) {
+            gb->returned_open_bus = false;
+        }
+        else {
+            gb->data_bus = data;
+            gb->data_bus_decay_countdown = gb->data_bus_decay;
+        }
+        return data;
+    }
+slow:
+#endif
+    return GB_read_memory(gb, addr);
+}
+
 #define GB_is_cgb(gb) GB_is_cgb_inline(gb)
 #define GB_is_sgb(gb) GB_is_sgb_inline(gb)
 #define GB_is_hle_sgb(gb) GB_is_hle_sgb_inline(gb)
