@@ -288,6 +288,8 @@ static void audio_thread_push_update(GB_gameboy_t *gb, GB_channel_t index, const
 /* Feeds a channel level change into the band-limited synthesizer (or the audio thread) */
 static inline void emit_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sample_t *output, unsigned cycles_offset)
 {
+    if (output->packed == gb->apu_output.emitted[index].packed) return;
+    gb->apu_output.emitted[index].packed = output->packed;
     bool unfiltered = unlikely(gb->apu_output.max_cycles_per_sample == 1);
     unsigned arg = unfiltered? cycles_offset :
         (((gb->apu_output.sample_fraction + sample_fraction_multiply(gb, cycles_offset)) >> 8) * GB_BAND_LIMITED_PHASES) >> 20;
@@ -353,6 +355,7 @@ static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t 
     }
 
     if (gb->apu_output.sample_rate) {
+        gb->apu_output.emit_pending[index] = false;
         unsigned right_volume = 0;
         if (gb->io_registers[GB_IO_NR51] & (1 << index)) {
             right_volume = (gb->io_registers[GB_IO_NR50] & 7) + 1;
@@ -369,9 +372,19 @@ static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t 
     }
 }
 
-static void update_sample(GB_gameboy_t *gb, GB_channel_t index, int8_t value, unsigned cycles_offset)
+static inline void update_sample(GB_gameboy_t *gb, GB_channel_t index, int8_t value, unsigned cycles_offset)
 {
+    /* Channels step (duty, LFSR, wave position) far more often than their level changes.
+       Before the AGB, a channel's mixer output only depends on its level, NR50, NR51 and
+       the mute flag; NR50/NR51 writes re-emit every channel and emit_pending covers the
+       rest, so an unchanged level would only re-emit the same output. */
+    if (gb->model <= GB_MODEL_CGB_E && value == gb->apu.samples[index] && !gb->apu_output.emit_pending[index]) return;
     update_sample_internal(gb, index, value, cycles_offset, false);
+}
+
+void GB_apu_invalidate_levels(GB_gameboy_t *gb)
+{
+    memset(gb->apu_output.emit_pending, true, sizeof(gb->apu_output.emit_pending));
 }
 
 static double smooth(double x)
@@ -1324,6 +1337,7 @@ restart:;
 void GB_apu_init(GB_gameboy_t *gb)
 {
     memset(&gb->apu, 0, sizeof(gb->apu));
+    GB_apu_invalidate_levels(gb);
     gb->apu.apu_cycles_in_2mhz = true;
     gb->apu.lf_div = 1;
     gb->apu.wave_channel.shift = 4;
@@ -2460,6 +2474,7 @@ void GB_set_sample_rate(GB_gameboy_t *gb, unsigned sample_rate)
         GB_ASSERT_NOT_RUNNING_OTHER_THREAD(gb)
     }
     gb->apu_output.sample_rate = sample_rate;
+    GB_apu_invalidate_levels(gb);
     if (sample_rate) {
         gb->apu_output.highpass_rate = pow(0.999958, GB_get_clock_rate(gb) / (double)sample_rate);
         gb->apu_output.max_cycles_per_sample = ceil(GB_get_clock_rate(gb) / 2.0 / sample_rate);
@@ -2482,6 +2497,7 @@ void GB_set_sample_rate_by_clocks(GB_gameboy_t *gb, double cycles_per_sample)
         return;
     }
     gb->apu_output.sample_rate = GB_get_clock_rate(gb) / cycles_per_sample * 2;
+    GB_apu_invalidate_levels(gb);
     gb->apu_output.highpass_rate = pow(0.999958, cycles_per_sample);
     gb->apu_output.max_cycles_per_sample = ceil(cycles_per_sample / 4);
     
@@ -2872,6 +2888,7 @@ void GB_set_channel_muted(GB_gameboy_t *gb, GB_channel_t channel, bool muted)
 {
     assert(channel < GB_N_CHANNELS);
     gb->apu_output.channel_muted[channel] = muted;
+    gb->apu_output.emit_pending[channel] = true;
 }
 
 bool GB_is_channel_muted(GB_gameboy_t *gb, GB_channel_t channel)

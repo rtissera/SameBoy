@@ -230,6 +230,12 @@ typedef struct {
     uint8_t dac_delay_pos;
     bool channel_muted[GB_N_CHANNELS];
     bool edge_triggered[GB_N_CHANNELS];
+    /* Last level fed to each channel's band-limited synthesizer by emit_update (the only
+       writer of its input): an update with an unchanged level is a no-op there, skip it */
+    GB_sample_t emitted[GB_N_CHANNELS];
+    /* The next update of the channel must reach update_sample_internal even if its level is
+       unchanged (set when the mixer output may be stale: init, state load, sample rate, mute) */
+    bool emit_pending[GB_N_CHANNELS];
 
     GB_highpass_mode_t highpass_mode;
     double highpass_rate;
@@ -295,6 +301,7 @@ bool GB_is_audio_thread_enabled(GB_gameboy_t *gb);
 #ifdef GB_INTERNAL
 internal bool GB_apu_is_DAC_enabled(GB_gameboy_t *gb, GB_channel_t index);
 internal void GB_apu_write(GB_gameboy_t *gb, uint8_t reg, uint8_t value);
+internal void GB_apu_invalidate_levels(GB_gameboy_t *gb);
 internal uint8_t GB_apu_read(GB_gameboy_t *gb, uint8_t reg);
 internal void GB_apu_div_event(GB_gameboy_t *gb);
 internal void GB_apu_div_secondary_event(GB_gameboy_t *gb);
