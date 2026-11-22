@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* sched_getaffinity / CPU_COUNT */
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -20,6 +23,9 @@
 #include "libretro.h"
 #include "libretro_core_options.inc"
 #include "iretro_extensions.h"
+#ifdef GB_THREADED_AUDIO
+#include <sched.h>
+#endif
 
 #ifdef _WIN32
 static const char slash = '\\';
@@ -93,6 +99,7 @@ static bool libretro_supports_bitmasks = false;
 
 static unsigned emulated_devices = 1;
 static bool initialized = false;
+
 static unsigned screen_layout = 0;
 static unsigned audio_out = 0;
 
@@ -109,6 +116,45 @@ static struct {
 char retro_system_directory[4096];
 
 GB_gameboy_t gameboy[2];
+
+#ifdef GB_THREADED_AUDIO
+/* sameboy_audio_thread: 0 = auto, 1 = enabled, 2 = disabled */
+static unsigned audio_thread_mode = 0;
+
+/* CPUs this process may run on (honours taskset/cgroup affinity), falling back to the online count */
+static unsigned usable_cpus(void)
+{
+#ifdef CPU_COUNT
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+#endif
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (unsigned)n : 1;
+}
+
+static void apply_audio_thread(void)
+{
+    bool want = false;
+    /* Not with two emulated devices: both would write to the shared output buffer concurrently. */
+    if (emulated_devices == 1) {
+        if (audio_thread_mode == 1) want = true;
+        else if (audio_thread_mode == 0) {
+            static unsigned cpus = 0;
+            if (!cpus) cpus = usable_cpus();
+            want = cpus >= 2;
+        }
+    }
+    for (unsigned i = 0; i < emulated_devices; i++) {
+        if (GB_is_inited(&gameboy[i])) {
+            GB_set_audio_thread_enabled(&gameboy[i], want && i == 0);
+        }
+    }
+}
+#endif
 
 extern const unsigned char dmg_boot[], mgb_boot[], cgb0_boot[], cgb_boot[], agb_boot[], sgb_boot[], sgb2_boot[];
 extern const unsigned dmg_boot_length, mgb_boot_length, cgb0_boot_length, cgb_boot_length, agb_boot_length, sgb_boot_length, sgb2_boot_length;
@@ -413,7 +459,8 @@ static void set_variable_visibility(void)
             (strcmp(key, "sameboy_high_pass_filter_mode")   == 0) ||
             (strcmp(key, "sameboy_audio_interference")      == 0) ||
             (strcmp(key, "sameboy_rumble")                  == 0) ||
-            (strcmp(key, "sameboy_timing_accuracy")         == 0)) {
+            (strcmp(key, "sameboy_timing_accuracy")         == 0) ||
+            (strcmp(key, "sameboy_audio_thread")            == 0)) {
             option_display_singlecart.key = key;
             environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display_singlecart);
         }
@@ -750,9 +797,8 @@ static void init_for_current_model(unsigned id)
     }
     GB_apu_set_sample_callback(&gameboy[i], audio_callback);
 #ifdef GB_THREADED_AUDIO
-    /* Offload audio synthesis to another core. Not with two emulated devices: both would
-       write to the shared output buffer concurrently. */
-    GB_set_audio_thread_enabled(&gameboy[i], emulated_devices == 1);
+    /* Offload audio synthesis to another core when there is one (sameboy_audio_thread) */
+    apply_audio_thread();
 #endif
     GB_set_rumble_callback(&gameboy[i], rumble_callback);
 
@@ -970,6 +1016,15 @@ static void check_variables()
         if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
             GB_set_lazy_cpu(&gameboy[0], strcmp(var.value, "fast") == 0);
         }
+
+#ifdef GB_THREADED_AUDIO
+        var.key = "sameboy_audio_thread";
+        var.value = NULL;
+        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+            audio_thread_mode = strcmp(var.value, "enabled") == 0 ? 1 : strcmp(var.value, "disabled") == 0 ? 2 : 0;
+        }
+        apply_audio_thread();
+#endif
 
         var.key = "sameboy_rumble";
         var.value = NULL;

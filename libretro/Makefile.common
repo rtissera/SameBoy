@@ -27,7 +27,13 @@ SOURCES_C   := $(CORE_DIR)/Core/gb.c \
 
 CFLAGS += -DGB_DISABLE_TIMEKEEPING -DGB_DISABLE_REWIND -DGB_DISABLE_DEBUGGER -DGB_DISABLE_CHEATS
 
-# THREADED_AUDIO=1: run band-limited audio synthesis on a second thread (multi-core targets)
+# THREADED_AUDIO=1: build the audio thread (core option sameboy_audio_thread, auto by default:
+# used when at least two CPUs are available). Defaults to on for Linux targets, off elsewhere.
+ifeq ($(THREADED_AUDIO),)
+ifneq (,$(findstring linux,$(shell $(CC) -dumpmachine 2>/dev/null)))
+THREADED_AUDIO = 1
+endif
+endif
 ifeq ($(THREADED_AUDIO),1)
 CFLAGS += -DGB_THREADED_AUDIO -pthread
 LDFLAGS += -pthread

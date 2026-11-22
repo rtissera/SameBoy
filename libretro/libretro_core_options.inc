@@ -275,6 +275,23 @@ struct retro_core_option_v2_definition option_defs_us[] = {
         },
         "exact"
     },
+#ifdef GB_THREADED_AUDIO
+    {
+        "sameboy_audio_thread",
+        "System - Audio Thread",
+        "Audio Thread",
+        "Runs sound synthesis on a second CPU core. Auto enables it when this process can use at least two cores. The output is identical either way; it only moves work off the emulation thread.",
+        NULL,
+        "system",
+        {
+            { "auto",     "Auto"     },
+            { "enabled",  "Enabled"  },
+            { "disabled", "Disabled" },
+            { NULL, NULL },
+        },
+        "auto"
+    },
+#endif
 
     /* Core options used in dual cart mode */
 
