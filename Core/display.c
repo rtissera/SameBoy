@@ -1550,37 +1550,78 @@ static void update_frame_parity(GB_gameboy_t *gb)
  */
 static void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force);
 
-/* Fast path for calls that would only advance the free-running counters: the PPU
-   state machine is either sleeping (GB_SLEEP not expired) or waiting at the mode 2 or
-   mode 3 GB_BATCHPOINT for enough cycles to batch. In those cases display_run_full
-   performs exactly these updates and returns; doing them here avoids its large
-   prologue and dispatch, which run on every M-cycle (~80% of calls are trivial). */
+/* Largest cycle count for which GB_display_run(gb, cycles, false) would only advance the
+   free-running counters: the PPU state machine is sleeping (GB_SLEEP not expired) or
+   waiting at the mode 2 / mode 3 GB_BATCHPOINT, and no special condition (WY check, line
+   boundary, glitched HBlank interrupt, DMG STOP) needs the full path. -1 if none.
+   Single source for the fast path below and for HALT batching. */
+static inline int32_t display_trivial_budget(GB_gameboy_t *gb)
+{
+    if (!gb->wy_triggered && gb->wy_check_scheduled) return -1;
+    if (gb->stopped && !GB_is_cgb(gb)) return -1;
+    int32_t display_cycles = gb->display_cycles;
+    int32_t budget = -display_cycles;
+    if (gb->display_state == 3) {
+        budget = MAX(budget, (int32_t)gb->mode3_batching_length * 2 - 1 - display_cycles);
+    }
+    else if (gb->display_state == 5) {
+        budget = MAX(budget, 80 * 2 - 1 - display_cycles);
+    }
+    if (gb->delayed_glitch_hblank_interrupt && gb->current_line < LINES) {
+        budget = MIN(budget, 0);
+    }
+    if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) {
+        budget = MIN(budget, LINE_LENGTH * 2 - (int32_t)gb->cycles_for_line * 2 - display_cycles);
+    }
+    return budget < 0? -1 : budget;
+}
+
+int32_t GB_display_trivial_budget(GB_gameboy_t *gb)
+{
+    return display_trivial_budget(gb);
+}
+
+/* Fast path for calls that would only advance the free-running counters (see above).
+   In those cases display_run_full performs exactly these updates and returns; doing them
+   here avoids its large prologue and dispatch, which run on every M-cycle (~80% of calls
+   are trivial). */
 void GB_display_run(GB_gameboy_t *gb, unsigned cycles, bool force)
 {
+    bool trivial = false;
     if (likely(!force)) {
+        /* Short-circuit form of (cycles <= display_trivial_budget(gb)), cheaper on the
+           per-M-cycle path; GB_HALT_VERIFY builds check that both always agree. */
         int32_t new_display_cycles = gb->display_cycles + cycles;
-        if ((new_display_cycles <= 0 ||
-             (gb->display_state == 3 && new_display_cycles < gb->mode3_batching_length * 2) ||
-             (gb->display_state == 5 && new_display_cycles < 80 * 2)) &&
-            (gb->wy_triggered || !gb->wy_check_scheduled) &&
-            !((gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) && (signed)(gb->cycles_for_line * 2 + cycles + gb->display_cycles) > LINE_LENGTH * 2) &&
-            !(gb->delayed_glitch_hblank_interrupt && cycles && gb->current_line < LINES) &&
-            !(gb->stopped && !GB_is_cgb(gb))) {
-            if (gb->wy_triggered) {
-                gb->wy_check_scheduled = false;
-            }
-            gb->cycles_since_vblank_callback += cycles / 2;
-            gb->frame_parity_ticks += cycles;
-            gb->wy_check_modulo += cycles;
-            if (cycles < gb->frame_repeat_countdown) {
-                gb->frame_repeat_countdown -= cycles;
-            }
-            else {
-                gb->frame_repeat_countdown = 0;
-            }
-            gb->display_cycles = new_display_cycles;
-            return;
+        trivial = (new_display_cycles <= 0 ||
+                   (gb->display_state == 3 && new_display_cycles < gb->mode3_batching_length * 2) ||
+                   (gb->display_state == 5 && new_display_cycles < 80 * 2)) &&
+                  (gb->wy_triggered || !gb->wy_check_scheduled) &&
+                  !((gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) && (signed)(gb->cycles_for_line * 2 + cycles + gb->display_cycles) > LINE_LENGTH * 2) &&
+                  !(gb->delayed_glitch_hblank_interrupt && cycles && gb->current_line < LINES) &&
+                  !(gb->stopped && !GB_is_cgb(gb));
+#ifdef GB_HALT_VERIFY
+        if (trivial != ((int32_t)cycles <= display_trivial_budget(gb))) {
+            fprintf(stderr, "display_trivial_budget mismatch: cycles=%u budget=%d state=%d display_cycles=%d\n",
+                    cycles, display_trivial_budget(gb), gb->display_state, gb->display_cycles);
+            abort();
         }
+#endif
+    }
+    if (trivial) {
+        if (gb->wy_triggered) {
+            gb->wy_check_scheduled = false;
+        }
+        gb->cycles_since_vblank_callback += cycles / 2;
+        gb->frame_parity_ticks += cycles;
+        gb->wy_check_modulo += cycles;
+        if (cycles < gb->frame_repeat_countdown) {
+            gb->frame_repeat_countdown -= cycles;
+        }
+        else {
+            gb->frame_repeat_countdown = 0;
+        }
+        gb->display_cycles += cycles;
+        return;
     }
     display_run_full(gb, cycles, force);
 }

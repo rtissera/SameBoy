@@ -285,7 +285,7 @@ internal void GB_apu_div_secondary_event(GB_gameboy_t *gb);
 internal void GB_apu_delayed_envelope_tick(GB_gameboy_t *gb);
 internal void GB_apu_init(GB_gameboy_t *gb);
 internal void GB_apu_run(GB_gameboy_t *gb, bool force);
-internal void GB_apu_vgm_advance(GB_gameboy_t *gb, uint8_t cycles);
+internal void GB_apu_vgm_advance(GB_gameboy_t *gb, unsigned cycles);
 internal void GB_apu_vgm_write(GB_gameboy_t *gb, uint8_t reg, uint8_t value);
 #ifdef GB_THREADED_AUDIO
 internal void GB_apu_flush_audio_thread(GB_gameboy_t *gb); /* Waits until all queued audio work is done */
