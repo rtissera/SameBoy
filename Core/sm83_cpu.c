@@ -82,10 +82,83 @@ static const conflict_t sgb_conflict_map[0x80] = {
     [GB_IO_SCX] = GB_CONFLICT_SCX_DMG_AND_CGB_DOUBLE,
 };
 
+/* Lazy CPU
+   An access to memory no other unit can observe (or modify) does not need the rest of the
+   machine to be up to date: its cycles are deferred and applied in one GB_advance_cycles call
+   when the CPU touches observable memory, or before the deferred amount would reach the next
+   hardware event (GB_lazy_cpu_budget: PPU/timer/APU/serial/... events). Interrupts are still
+   detected in time since IF can only gain an enabled bit at such an event. */
+static inline bool lazy_cart_is_plain(GB_gameboy_t *gb)
+{
+    const GB_cartridge_t *cart = gb->cartridge_type;
+    if (cart->has_rtc) return false;
+    switch (cart->mbc_type) {
+        case GB_NO_MBC:
+        case GB_MBC1:
+        case GB_MBC2:
+        case GB_MBC3:
+        case GB_MBC5:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline bool lazy_address_is_private(GB_gameboy_t *gb, uint16_t addr)
+{
+    if (addr < 0x8000) return lazy_cart_is_plain(gb);  /* ROM reads, MBC register writes */
+    if (addr < 0xA000) return false;                    /* VRAM */
+    if (addr < 0xC000) return lazy_cart_is_plain(gb);  /* Cartridge RAM */
+    if (addr < 0xFE00) return true;                     /* WRAM and echo */
+    if (addr < 0xFF80) return false;                    /* OAM, unusable range, I/O */
+    return addr != 0xFFFF;                              /* HRAM, but not IE */
+}
+
+static void lazy_flush(GB_gameboy_t *gb, unsigned cycles)
+{
+    if (likely(!gb->lazy_deferred_cycles)) {
+        if (cycles) {
+            GB_advance_cycles(gb, cycles);
+        }
+        return;
+    }
+    unsigned total = gb->lazy_deferred_cycles + cycles;
+    unsigned steps = gb->lazy_deferred_steps + (cycles? 1 : 0);
+    gb->lazy_deferred_cycles = 0;
+    gb->lazy_deferred_steps = 0;
+    GB_advance_cycles_chunked(gb, total, steps);
+}
+
+void GB_cpu_lazy_flush(GB_gameboy_t *gb)
+{
+    lazy_flush(gb, 0);
+}
+
+/* Maximum number of CPU cycles the CPU may run ahead of the rest of the machine. This bounds
+   how late the CPU can notice an interrupt (relaxed accuracy). */
+#define GB_LAZY_MAX_LAG (32 * 4)
+
+/* Brings the machine forward by `cycles` before an access to addr, possibly deferring it */
+static inline void lazy_sync(GB_gameboy_t *gb, unsigned cycles, uint16_t addr)
+{
+    if (gb->lazy_cpu_enabled && lazy_address_is_private(gb, addr)) {
+        if (!cycles) return;
+        if (!gb->lazy_deferred_cycles) {
+            gb->lazy_budget_cycles = GB_lazy_cpu_allowed(gb)? GB_LAZY_MAX_LAG : 0;
+        }
+        if (gb->lazy_deferred_cycles + cycles <= gb->lazy_budget_cycles) {
+            gb->lazy_deferred_cycles += cycles;
+            gb->lazy_deferred_steps++;
+            return;
+        }
+    }
+    lazy_flush(gb, cycles);
+}
+
 static uint8_t cycle_read(GB_gameboy_t *gb, uint16_t addr)
 {
-    if (gb->pending_cycles) {
-        GB_advance_cycles(gb, gb->pending_cycles);
+    if (gb->pending_cycles || gb->lazy_deferred_cycles) {
+        lazy_sync(gb, gb->pending_cycles, addr);
     }
     gb->address_bus = addr;
     uint8_t ret = GB_read_memory(gb, addr);
@@ -102,7 +175,7 @@ static uint8_t cycle_read(GB_gameboy_t *gb, uint16_t addr)
 static uint8_t cycle_write_if(GB_gameboy_t *gb, uint8_t value)
 {
     assert(gb->pending_cycles);
-    GB_advance_cycles(gb, gb->pending_cycles);
+    lazy_flush(gb, gb->pending_cycles);
     gb->address_bus = 0xFF00 + GB_IO_IF;
     uint8_t old = (gb->io_registers[GB_IO_IF]) & 0x1F;
     GB_write_memory(gb, 0xFF00 + GB_IO_IF, value);
@@ -115,6 +188,7 @@ static void cycle_write(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
     assert(gb->pending_cycles);
     conflict_t conflict = GB_CONFLICT_READ_OLD;
     if ((addr & 0xFF80) == 0xFF00) {
+        lazy_flush(gb, 0); /* I/O writes keep their exact sub-M-cycle timing */
         const conflict_t *map = NULL;
         if (GB_is_cgb(gb)) {
             map = gb->cgb_double_speed? cgb_double_conflict_map : cgb_conflict_map;
@@ -129,7 +203,7 @@ static void cycle_write(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
     }
     switch (conflict) {
         case GB_CONFLICT_READ_OLD:
-            GB_advance_cycles(gb, gb->pending_cycles);
+            lazy_sync(gb, gb->pending_cycles, addr);
             GB_write_memory(gb, addr, value);
             gb->pending_cycles = 4;
             break;
@@ -325,8 +399,8 @@ static void cycle_no_access(GB_gameboy_t *gb)
 
 static void cycle_oam_bug(GB_gameboy_t *gb, uint8_t register_id)
 {
-    if (gb->pending_cycles) {
-        GB_advance_cycles(gb, gb->pending_cycles);
+    if (gb->pending_cycles || gb->lazy_deferred_cycles) {
+        lazy_sync(gb, gb->pending_cycles, gb->registers[register_id]);
     }
     gb->address_bus = gb->registers[register_id];
     GB_trigger_oam_bug(gb, gb->registers[register_id]); /* Todo: test T-cycle timing */
@@ -335,8 +409,15 @@ static void cycle_oam_bug(GB_gameboy_t *gb, uint8_t register_id)
 
 static void flush_pending_cycles(GB_gameboy_t *gb)
 {
-    if (gb->pending_cycles) {
-        GB_advance_cycles(gb, gb->pending_cycles);
+    lazy_flush(gb, gb->pending_cycles);
+    gb->pending_cycles = 0;
+}
+
+/* End of an instruction: the next access is the opcode fetch at PC */
+static void end_instruction_cycles(GB_gameboy_t *gb)
+{
+    if (gb->pending_cycles || gb->lazy_deferred_cycles) {
+        lazy_sync(gb, gb->pending_cycles, gb->pc);
     }
     gb->pending_cycles = 0;
 }
@@ -1605,6 +1686,9 @@ static opcode_t *opcodes[256] = {
 };
 void GB_cpu_run(GB_gameboy_t *gb)
 {
+    if (unlikely(gb->lazy_deferred_cycles) && (gb->halted || gb->stopped)) {
+        lazy_flush(gb, 0);
+    }
     if (unlikely(gb->stopped)) {
         GB_timing_sync(gb);
         GB_advance_cycles(gb, 4);
@@ -1723,5 +1807,5 @@ void GB_cpu_run(GB_gameboy_t *gb)
         opcodes[opcode](gb, opcode);
     }
     
-    flush_pending_cycles(gb);
+    end_instruction_cycles(gb);
 }

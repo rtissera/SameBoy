@@ -614,13 +614,23 @@ void GB_advance_cycles(GB_gameboy_t *gb, unsigned cycles)
 
 #define GB_HALT_BATCH_MAX 60
 
-unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
+/* Number of upcoming M-cycles during which no unit needs per-step work and no enabled
+   interrupt can be raised, so that advancing them in a single GB_advance_cycles call is
+   equivalent. Used for HALT batching (halted) and for the lazy CPU (running). */
+static unsigned event_budget(GB_gameboy_t *gb, bool halted)
 {
 #ifndef GB_DISABLE_DEBUGGER
     return 0; /* The debugger hooks every GB_run call */
 #endif
     if (!gb->halt_batching_allowed) return 0;
-    if (!gb->halted || gb->just_halted || gb->stopped) return 0;
+    if (gb->stopped) return 0;
+    if (halted) {
+        if (gb->just_halted) return 0;
+    }
+    else {
+        /* The CPU shares the bus with OAM DMA and HDMA; keep them in lockstep */
+        if (GB_is_dma_active(gb) || gb->hdma_on || gb->hdma_in_progress) return 0;
+    }
     /* Most frequent blockers first: an APU run due within one M-cycle (always the case
        while the wave channel forces per-cycle APU runs), or a non-trivial PPU step */
     const unsigned apu_step = 1 << !gb->cgb_double_speed;
@@ -631,8 +641,10 @@ unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
     int32_t display_budget = GB_display_trivial_budget(gb);
     if (display_budget < (int32_t)(2 * units)) return 0; /* Not worth it below 2 iterations */
 
-    if (gb->ime_toggle || gb->pending_cycles) return 0;
-    if (gb->interrupt_enable & gb->io_registers[GB_IO_IF] & 0x1F) return 0;
+    if (halted) {
+        if (gb->ime_toggle || gb->pending_cycles) return 0;
+        if (gb->interrupt_enable & gb->io_registers[GB_IO_IF] & 0x1F) return 0;
+    }
     if (gb->speed_switch_countdown || gb->speed_switch_halt_countdown || gb->speed_switch_freeze) return 0;
     if (gb->printer_callback || gb->printer_done_callback || gb->accessory == GB_ACCESSORY_PRINTER) return 0;
     if (gb->apu_output.output_file) return 0;
@@ -674,7 +686,7 @@ unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
     }
     
     /* GB_timing_sync runs every iteration in this state; it must keep returning early */
-    if ((gb->interrupt_enable & 0x10)) {
+    if ((gb->interrupt_enable & 0x10) && (gb->ime || halted)) {
         if (gb->cycles_since_last_sync + units >= LCDC_PERIOD / 3) return 0;
         n = MIN(n, (unsigned)((LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units));
         if (!n) return 0;
@@ -713,6 +725,79 @@ unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
     }
     return n;
 }
+
+unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
+{
+    if (!gb->halted) return 0;
+    return event_budget(gb, true);
+}
+
+/* Lazy CPU (relaxed): whether the CPU may run ahead of the rest of the machine at all */
+bool GB_lazy_cpu_allowed(GB_gameboy_t *gb)
+{
+#ifndef GB_DISABLE_DEBUGGER
+    return false;
+#endif
+    if (!gb->lazy_cpu_enabled || !gb->halt_batching_allowed) return false;
+    if (gb->stopped || gb->halted) return false;
+    if (GB_is_dma_active(gb) || gb->hdma_on || gb->hdma_in_progress) return false;
+    if (gb->speed_switch_countdown || gb->speed_switch_halt_countdown || gb->speed_switch_freeze) return false;
+    if (gb->printer_callback || gb->printer_done_callback || gb->accessory == GB_ACCESSORY_PRINTER) return false;
+    if (gb->apu_output.output_file) return false;
+    if (!gb->joypad_is_stable || gb->inputs_changed) return false;
+    return true;
+}
+
+/* Number of M-cycles that can be advanced in one GB_advance_cycles call while keeping the
+   units exact relative to each other: never more than GB_LAZY_CHUNK (so the PPU crosses at
+   most one line boundary per call), and ending exactly where the APU guard would fire or
+   at the next DIV-APU edge, so sample renders and APU events keep their exact cycle. */
+#define GB_LAZY_CHUNK 16
+static unsigned lazy_chunk_limit(GB_gameboy_t *gb)
+{
+    unsigned limit = GB_LAZY_CHUNK;
+    const unsigned apu_step = 1 << !gb->cgb_double_speed;
+    const unsigned sample_step = (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
+    if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step, gb->apu_output.sample_cycles + sample_step)) return 1;
+    if (sample_step) {
+        limit = MIN(limit, (gb->clock_rate - gb->apu_output.sample_cycles + sample_step - 1) / sample_step);
+    }
+    unsigned used = gb->apu.apu_cycles + gb->apu_output.cycles_since_render;
+    if (used < gb->apu_output.max_cycles_per_sample) {
+        limit = MIN(limit, (gb->apu_output.max_cycles_per_sample - used + apu_step - 1) / apu_step);
+    }
+    uint16_t apu_bit = gb->cgb_double_speed? 0x2000 : 0x1000;
+    limit = MIN(limit, (apu_bit - (gb->div_counter & (apu_bit - 1)) + 3) / 4);
+    /* Units that are not batch-safe in their current state */
+    const GB_cartridge_t *cart = gb->cartridge_type;
+    if ((gb->model <= GB_MODEL_CGB_E && gb->cgb_mode) || cart->mbc_type == GB_HUC1 || cart->mbc_type == GB_HUC3) {
+        bool is_sensing = (gb->io_registers[GB_IO_RP] & 0xC0) == 0xC0 ||
+                          (cart->mbc_type == GB_HUC1 && gb->huc1.ir_mode) ||
+                          (cart->mbc_type == GB_HUC3 && gb->huc3.mode == 0xE);
+        if (is_sensing || gb->ir_warmup || gb->ir_decay) return 1;
+    }
+    if (gb->div_state != 2 || gb->apu.pending_envelope_tick) return 1;
+    return MAX(limit, 1);
+}
+
+/* Applies `cycles` CPU cycles that were deferred over `steps` CPU accesses */
+void GB_advance_cycles_chunked(GB_gameboy_t *gb, unsigned cycles, unsigned steps)
+{
+    unsigned calls = 0;
+    while (cycles) {
+        unsigned chunk = MIN(cycles, lazy_chunk_limit(gb) * 4);
+        GB_advance_cycles(gb, chunk);
+        cycles -= chunk;
+        calls++;
+    }
+    /* Per-call side effects of GB_advance_cycles, as if called once per deferred access */
+    if (steps > calls) {
+        gb->rumble_on_cycles += (gb->rumble_strength & 3) * (steps - calls);
+        gb->rumble_off_cycles += ((gb->rumble_strength & 3) ^ 3) * (steps - calls);
+    }
+    gb->dma_cycles = 4;
+}
+
 
 static void halt_batch_apply(GB_gameboy_t *gb, unsigned iterations)
 {

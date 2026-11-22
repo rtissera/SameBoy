@@ -1247,6 +1247,7 @@ uint64_t GB_run_frame(GB_gameboy_t *gb)
         }
     }
     gb->halt_batching_allowed = false;
+    GB_cpu_lazy_flush(gb); /* Leave the machine fully synchronized between frames */
     gb->turbo = old_turbo;
     gb->turbo_dont_skip = old_dont_skip;
     gb->turbo_cap_multiplier = old_turbo_cap;
@@ -1427,6 +1428,12 @@ bool (GB_is_sgb)(GB_gameboy_t *gb)
 bool (GB_is_hle_sgb)(GB_gameboy_t *gb)
 {
     return (gb->model & ~GB_MODEL_PAL_BIT) == GB_MODEL_SGB || gb->model == GB_MODEL_SGB2;
+}
+
+void GB_set_lazy_cpu(GB_gameboy_t *gb, bool enabled)
+{
+    GB_cpu_lazy_flush(gb);
+    gb->lazy_cpu_enabled = enabled;
 }
 
 void GB_set_turbo_mode(GB_gameboy_t *gb, bool on, bool no_frame_skip)

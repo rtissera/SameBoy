@@ -842,6 +842,11 @@ struct GB_gameboy_internal_s {
         uint8_t boot_rom[0x900];
         bool vblank_just_occured; // For slow operations involving syscalls; these should only run once per vblank
         bool halt_batching_allowed; // Set while inside GB_run_frame, see GB_halt_batch_iterations
+        /* Lazy CPU (GB_set_lazy_cpu): CPU cycles not yet applied to the rest of the machine */
+        bool lazy_cpu_enabled;
+        unsigned lazy_deferred_cycles;
+        unsigned lazy_deferred_steps;
+        unsigned lazy_budget_cycles;
         unsigned cycles_since_run; // How many cycles have passed since the last call to GB_run(), in 8MHz units
         double clock_multiplier;
         GB_rumble_mode_t rumble_mode;
@@ -959,6 +964,11 @@ void GB_load_battery_from_buffer(GB_gameboy_t *gb, const uint8_t *buffer, size_t
 int GB_load_battery(GB_gameboy_t *gb, const char *path);
 
 void GB_set_turbo_mode(GB_gameboy_t *gb, bool on, bool no_frame_skip);
+/* Lazy CPU: the rest of the machine is only synchronized when the CPU accesses memory other
+   units can observe (I/O, VRAM, OAM, special cartridge registers) or before the next hardware
+   event that could raise an interrupt. Much faster, but no longer cycle-exact in corner cases.
+   Only active within GB_run_frame. Off by default. */
+void GB_set_lazy_cpu(GB_gameboy_t *gb, bool enabled);
 void GB_set_turbo_cap(GB_gameboy_t *gb, double multiplier); // Use 0 to use no cap
 void GB_set_rendering_disabled(GB_gameboy_t *gb, bool disabled);
     
@@ -1095,6 +1105,8 @@ static inline bool GB_apu_needs_run(const GB_gameboy_t *gb, unsigned apu_cycles,
               first. (Lazy wave: not bit-exact, see the commit message.) */
            (gb->model <= GB_MODEL_CGB_E && (gb->apu.wave_channel.bugged_read_countdown || (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && !gb->apu.is_active[GB_WAVE])));
 }
+
+internal void GB_cpu_lazy_flush(GB_gameboy_t *gb);
 
 #define GB_is_cgb(gb) GB_is_cgb_inline(gb)
 #define GB_is_sgb(gb) GB_is_sgb_inline(gb)
