@@ -1776,6 +1776,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
         GB_STATE(gb, display, 41);
         GB_STATE(gb, display, 42);
         GB_STATE(gb, display, 43);
+        GB_STATE(gb, display, 44);
     }
     
     gb->wy_check_modulo = cycles;
@@ -1936,6 +1937,20 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             gb->n_visible_objs = 0;
             gb->orig_n_visible_objs = 0;
             
+            if (gb->lazy_cpu_enabled && !GB_is_dma_active(gb) && !gb->oam_ppu_blocked) {
+                /* Relaxed accuracy: the whole OAM scan happens at the start of mode 2 */
+                for (unsigned i = 0; i < 40; i++) {
+                    add_object_from_index(gb, i);
+                }
+                gb->oam_search_index = 40;
+                gb->accessed_oam_row = -1;
+                gb->vram_read_blocked = !GB_is_cgb(gb);
+                gb->vram_write_blocked = false;
+                gb->cgb_palettes_blocked = false;
+                gb->oam_write_blocked = GB_is_cgb(gb);
+                GB_SLEEP(gb, display, 44, 80);
+                goto oam_scan_done;
+            }
             if (!GB_is_dma_active(gb) && !gb->oam_ppu_blocked) {
                 GB_BATCHPOINT(gb, display, 5, 80);
             }
@@ -1956,6 +1971,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
                     gb->oam_write_blocked = GB_is_cgb(gb);
                 }
             }
+        oam_scan_done:
             gb->cycles_for_line = MODE2_LENGTH + 4;
             gb->orig_n_visible_objs = gb->n_visible_objs;
             gb->accessed_oam_row = -1;
