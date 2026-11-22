@@ -639,7 +639,10 @@ unsigned GB_halt_batch_iterations(GB_gameboy_t *gb)
     if (!gb->joypad_is_stable || gb->inputs_changed) return 0;
     if (gb->div_state != 2 || gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
     if (gb->apu.pending_envelope_tick) return 0;
-    if (gb->io_registers[GB_IO_SC] & 0x80) return 0; /* Serial transfer in progress */
+    /* Serial: an internally clocked transfer shifts on DIV edges and raises an interrupt.
+       An externally clocked one only advances on edges from a link partner (callbacks). */
+    if ((gb->io_registers[GB_IO_SC] & 0x81) == 0x81) return 0;
+    if ((gb->io_registers[GB_IO_SC] & 0x80) && (gb->serial_transfer_bit_start_callback || gb->serial_transfer_bit_end_callback)) return 0;
     
     const GB_cartridge_t *cart = gb->cartridge_type;
     /* IR: only its steady state (see ir_run) is a no-op */
