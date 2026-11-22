@@ -202,6 +202,7 @@ GB_model_t GB_get_model(GB_gameboy_t *gb)
 void GB_free(GB_gameboy_t *gb)
 {
     GB_ASSERT_NOT_RUNNING(gb)
+    GB_set_audio_thread_enabled(gb, false);
     gb->magic = 0;
     if (gb->ram) {
         free(gb->ram);
@@ -1247,6 +1248,7 @@ uint64_t GB_run_frame(GB_gameboy_t *gb)
     gb->turbo = old_turbo;
     gb->turbo_dont_skip = old_dont_skip;
     gb->turbo_cap_multiplier = old_turbo_cap;
+    GB_apu_flush_audio_thread(gb); /* Deliver all of this frame's samples before returning */
     return gb->cycles_since_last_sync * 1000000000LL / 2 / GB_get_clock_rate(gb); /* / 2 because we use 8MHz units */
 }
 

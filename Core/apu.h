@@ -234,7 +234,25 @@ typedef struct {
     
     /* Not output related, but it's temp state so I'll put it here */
     bool square_sweep_disable_stepping;
+#ifdef GB_THREADED_AUDIO
+    /* Non-NULL while band-limited synthesis, mixing, filtering and the sample callback
+       run on a dedicated thread (see GB_set_audio_thread_enabled) */
+    struct GB_audio_thread_s *audio_thread;
+#endif
 } GB_apu_output_t;
+
+/* Inputs of the second half of a sample render, captured on the emulation thread */
+typedef struct {
+    uint32_t multiplier[GB_N_CHANNELS];
+    double highpass_rate;
+    signed interference_bias;
+    GB_highpass_mode_t highpass_mode;
+    uint8_t enabled_dacs;
+    uint8_t nr50, nr51;
+    bool skip_output;
+    bool apply_filter;
+    bool has_interference;
+} GB_render_job_t;
 
 void GB_set_channel_muted(GB_gameboy_t *gb, GB_channel_t channel, bool muted);
 bool GB_is_channel_muted(GB_gameboy_t *gb, GB_channel_t channel);
@@ -251,6 +269,13 @@ uint8_t GB_get_channel_amplitude(GB_gameboy_t *gb, GB_channel_t channel);
 uint16_t GB_get_channel_period(GB_gameboy_t *gb, GB_channel_t channel);
 void GB_get_apu_wave_table(GB_gameboy_t *gb, uint8_t *wave_table);
 bool GB_get_channel_edge_triggered(GB_gameboy_t *gb, GB_channel_t channel);
+/* Moves band-limited synthesis, mixing, filtering and the sample callback to a dedicated
+   thread. Only available when built with GB_THREADED_AUDIO (no-op otherwise). While
+   enabled, the sample callback is called from that thread; all pending samples are
+   delivered before GB_run_frame returns. Not for frontends that drive the core with
+   GB_run and expect samples synchronously. Output is bit-identical either way. */
+void GB_set_audio_thread_enabled(GB_gameboy_t *gb, bool enabled);
+bool GB_is_audio_thread_enabled(GB_gameboy_t *gb);
 #ifdef GB_INTERNAL
 internal bool GB_apu_is_DAC_enabled(GB_gameboy_t *gb, GB_channel_t index);
 internal void GB_apu_write(GB_gameboy_t *gb, uint8_t reg, uint8_t value);
@@ -262,4 +287,9 @@ internal void GB_apu_init(GB_gameboy_t *gb);
 internal void GB_apu_run(GB_gameboy_t *gb, bool force);
 internal void GB_apu_vgm_advance(GB_gameboy_t *gb, uint8_t cycles);
 internal void GB_apu_vgm_write(GB_gameboy_t *gb, uint8_t reg, uint8_t value);
+#ifdef GB_THREADED_AUDIO
+internal void GB_apu_flush_audio_thread(GB_gameboy_t *gb); /* Waits until all queued audio work is done */
+#else
+#define GB_apu_flush_audio_thread(gb) ((void)0)
+#endif
 #endif

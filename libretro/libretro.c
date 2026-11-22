@@ -748,6 +748,11 @@ static void init_for_current_model(unsigned id)
 #endif
     }
     GB_apu_set_sample_callback(&gameboy[i], audio_callback);
+#ifdef GB_THREADED_AUDIO
+    /* Offload audio synthesis to another core. Not with two emulated devices: both would
+       write to the shared output buffer concurrently. */
+    GB_set_audio_thread_enabled(&gameboy[i], emulated_devices == 1);
+#endif
     GB_set_rumble_callback(&gameboy[i], rumble_callback);
 
     /* todo: attempt to make these more generic */

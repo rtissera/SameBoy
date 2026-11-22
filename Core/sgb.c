@@ -869,6 +869,7 @@ static double random_double(void)
 
 static void render_jingle(GB_gameboy_t *gb, size_t count)
 {
+    GB_apu_flush_audio_thread(gb); /* The jingle calls the sample callback from this thread */
     const double frequencies[7] = {
         466.16, // Bb4
         587.33, // D5

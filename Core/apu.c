@@ -234,6 +234,30 @@ static uint8_t agb_bias_for_channel(GB_gameboy_t *gb, GB_channel_t index)
     }
 }
 
+#ifdef GB_THREADED_AUDIO
+static void audio_thread_push_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sample_t *output, unsigned arg, bool unfiltered);
+#endif
+
+/* Feeds a channel level change into the band-limited synthesizer (or the audio thread) */
+static inline void emit_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sample_t *output, unsigned cycles_offset)
+{
+    bool unfiltered = unlikely(gb->apu_output.max_cycles_per_sample == 1);
+    unsigned arg = unfiltered? cycles_offset :
+        (((gb->apu_output.sample_fraction + sample_fraction_multiply(gb, cycles_offset)) >> 8) * GB_BAND_LIMITED_PHASES) >> 20;
+#ifdef GB_THREADED_AUDIO
+    if (gb->apu_output.audio_thread) {
+        audio_thread_push_update(gb, index, output, arg, unfiltered);
+        return;
+    }
+#endif
+    if (unfiltered) {
+        band_limited_update_unfiltered(&gb->apu_output.band_limited[index], output, arg);
+    }
+    else {
+        band_limited_update(&gb->apu_output.band_limited[index], output, arg);
+    }
+}
+
 static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t value, unsigned cycles_offset, bool force_update)
 {
     if (gb->model > GB_MODEL_CGB_E) {
@@ -266,14 +290,7 @@ static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t 
                 output.left = output.right = 0;
             }
             
-            if (unlikely(gb->apu_output.max_cycles_per_sample == 1)) {
-                band_limited_update_unfiltered(&gb->apu_output.band_limited[index], &output, cycles_offset);
-            }
-            else {
-                band_limited_update(&gb->apu_output.band_limited[index],
-                                    &output,
-                                    (((gb->apu_output.sample_fraction + sample_fraction_multiply(gb, cycles_offset)) >> 8) * GB_BAND_LIMITED_PHASES) >> 20);
-            }
+            emit_update(gb, index, &output, cycles_offset);
         }
         
         return;
@@ -301,14 +318,7 @@ static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t 
         if (likely(!gb->apu_output.channel_muted[index])) {
             output = (GB_sample_t){(0xF - value * 2) * left_volume, (0xF - value * 2) * right_volume};
         }
-        if (unlikely(gb->apu_output.max_cycles_per_sample == 1)) {
-            band_limited_update_unfiltered(&gb->apu_output.band_limited[index], &output, cycles_offset);
-        }
-        else {
-            band_limited_update(&gb->apu_output.band_limited[index],
-                                &output,
-                                (((gb->apu_output.sample_fraction + sample_fraction_multiply(gb, cycles_offset)) >> 8) * GB_BAND_LIMITED_PHASES) >> 20);
-        }
+        emit_update(gb, index, &output, cycles_offset);
     }
 }
 
@@ -361,9 +371,17 @@ static signed interference(GB_gameboy_t *gb)
     return ret;
 }
 
-static void render(GB_gameboy_t *gb)
+/* render() is split in two halves so the second can optionally run on a separate thread
+   (GB_THREADED_AUDIO):
+   - render_capture(): everything that reads or advances emulated/timing state (DAC
+     charge, DAC delay line, sample fraction, interference), executed on the emulation
+     thread at the exact sample time. Its results are stored in a GB_render_job_t.
+   - render_process(): band-limited synthesis reads, mixing, high-pass filtering and the
+     sample callback. It only depends on the job and on state it owns exclusively
+     (band_limited buffers, highpass_diff).
+   Called back to back, they perform the same computations in the same order as before. */
+static void render_capture(GB_gameboy_t *gb, GB_render_job_t *job)
 {
-    GB_sample_t output = {0, 0};
     uint8_t enabled_dacs = 0;
     /* TODO: only measured on one DMG (CPU revision unconfirmed);
        DAC timing is assumed shared by all pre-CGB models. */
@@ -408,11 +426,8 @@ static void render(GB_gameboy_t *gb)
             gb->apu_output.dac_delay[gb->apu_output.dac_delay_pos].multiplier[i] = multiplier;
             multiplier = delayed;
         }
-        GB_sample_t channel_output;
-        band_limited_read(&gb->apu_output.band_limited[i], &channel_output, multiplier);
-
-        output.left += channel_output.left;
-        output.right += channel_output.right;
+        /* Same double -> uint32_t conversion band_limited_read's parameter used to perform */
+        job->multiplier[i] = multiplier;
     }
     if (delay_dac) {
         uint8_t delayed = gb->apu_output.dac_delay[gb->apu_output.dac_delay_pos].enabled;
@@ -429,48 +444,80 @@ static void render(GB_gameboy_t *gb)
         gb->apu_output.sample_fraction -= 1 << 28;
     }
     
-    if (gb->sgb && gb->sgb->intro_animation < GB_SGB_INTRO_ANIMATION_LENGTH) return;
-
-    GB_sample_t filtered_output = {0, 0};
+    job->enabled_dacs = enabled_dacs;
+    job->skip_output = gb->sgb && gb->sgb->intro_animation < GB_SGB_INTRO_ANIMATION_LENGTH;
+    if (job->skip_output) return;
+    
     /* On pre-CGB models, the last DAC disconnects the mixer without waiting for discharge.
        Apply the same synthesis delay to connection and gain, then hold the
        coupling capacitor while disconnected.
        TODO: only measured on one DMG (CPU revision unconfirmed);
        assumed shared by all pre-CGB models. */
-    if (GB_is_cgb(gb) || enabled_dacs) {
-        filtered_output = gb->apu_output.highpass_mode?
+    job->apply_filter = GB_is_cgb(gb) || enabled_dacs;
+    job->highpass_mode = gb->apu_output.highpass_mode;
+    job->highpass_rate = gb->apu_output.highpass_rate;
+    job->nr50 = gb->io_registers[GB_IO_NR50];
+    job->nr51 = gb->io_registers[GB_IO_NR51];
+    
+    job->has_interference = gb->apu_output.interference_volume;
+    if (job->has_interference) {
+        signed interference_bias = interference(gb);
+        int16_t interference_sample = (interference_bias - gb->apu_output.interference_highpass);
+        gb->apu_output.interference_highpass = gb->apu_output.interference_highpass * gb->apu_output.highpass_rate +
+        (1 - gb->apu_output.highpass_rate) * interference_sample;
+        interference_bias *= gb->apu_output.interference_volume;
+        job->interference_bias = interference_bias;
+    }
+}
+
+static void render_process(GB_gameboy_t *gb, const GB_render_job_t *job)
+{
+    GB_sample_t output = {0, 0};
+    unrolled for (unsigned i = 0; i < GB_N_CHANNELS; i++) {
+        GB_sample_t channel_output;
+        band_limited_read(&gb->apu_output.band_limited[i], &channel_output, job->multiplier[i]);
+
+        output.left += channel_output.left;
+        output.right += channel_output.right;
+    }
+    
+    if (job->skip_output) return;
+
+    GB_sample_t filtered_output = {0, 0};
+    if (job->apply_filter) {
+        filtered_output = job->highpass_mode?
             (GB_sample_t) {output.left  - (int16_t)gb->apu_output.highpass_diff.left,
                            output.right - (int16_t)gb->apu_output.highpass_diff.right} :
             output;
 
-        switch (gb->apu_output.highpass_mode) {
+        switch (job->highpass_mode) {
             case GB_HIGHPASS_OFF:
                 gb->apu_output.highpass_diff = (GB_double_sample_t) {0, 0};
                 break;
             case GB_HIGHPASS_ACCURATE:
                 gb->apu_output.highpass_diff = (GB_double_sample_t) {
-                    output.left  - (output.left  - gb->apu_output.highpass_diff.left)  * gb->apu_output.highpass_rate,
-                    output.right - (output.right - gb->apu_output.highpass_diff.right) * gb->apu_output.highpass_rate
+                    output.left  - (output.left  - gb->apu_output.highpass_diff.left)  * job->highpass_rate,
+                    output.right - (output.right - gb->apu_output.highpass_diff.right) * job->highpass_rate
                 };
                 break;
             case GB_HIGHPASS_REMOVE_DC_OFFSET: {
-                unsigned mask = gb->io_registers[GB_IO_NR51];
+                unsigned mask = job->nr51;
                 unsigned left_volume = 0;
                 unsigned right_volume = 0;
                 unrolled for (unsigned i = GB_N_CHANNELS; i--;) {
-                    if (enabled_dacs & (1 << i)) {
+                    if (job->enabled_dacs & (1 << i)) {
                         if (mask & 1) {
-                            left_volume += ((gb->io_registers[GB_IO_NR50] & 7) + 1) * CH_STEP * 0xF;
+                            left_volume += ((job->nr50 & 7) + 1) * CH_STEP * 0xF;
                         }
                         if (mask & 0x10) {
-                            right_volume += (((gb->io_registers[GB_IO_NR50] >> 4) & 7) + 1) * CH_STEP * 0xF;
+                            right_volume += (((job->nr50 >> 4) & 7) + 1) * CH_STEP * 0xF;
                         }
                     }
                     mask >>= 1;
                 }
                 gb->apu_output.highpass_diff = (GB_double_sample_t) {
-                    left_volume  * (1 - gb->apu_output.highpass_rate) + gb->apu_output.highpass_diff.left * gb->apu_output.highpass_rate,
-                    right_volume * (1 - gb->apu_output.highpass_rate) + gb->apu_output.highpass_diff.right * gb->apu_output.highpass_rate
+                    left_volume  * (1 - job->highpass_rate) + gb->apu_output.highpass_diff.left * job->highpass_rate,
+                    right_volume * (1 - job->highpass_rate) + gb->apu_output.highpass_diff.right * job->highpass_rate
                 };
 
             case GB_HIGHPASS_MAX:;
@@ -480,13 +527,8 @@ static void render(GB_gameboy_t *gb)
     }
     
     
-    if (gb->apu_output.interference_volume) {
-        signed interference_bias = interference(gb);
-        int16_t interference_sample = (interference_bias - gb->apu_output.interference_highpass);
-        gb->apu_output.interference_highpass = gb->apu_output.interference_highpass * gb->apu_output.highpass_rate +
-        (1 - gb->apu_output.highpass_rate) * interference_sample;
-        interference_bias *= gb->apu_output.interference_volume;
-        
+    if (job->has_interference) {
+        signed interference_bias = job->interference_bias;
         filtered_output.left = MAX(MIN(filtered_output.left + interference_bias, 0x7FFF), -0x8000);
         filtered_output.right = MAX(MIN(filtered_output.right + interference_bias, 0x7FFF), -0x8000);
     }
@@ -505,6 +547,26 @@ static void render(GB_gameboy_t *gb)
             gb->apu_output.output_error = errno;
         }
     }
+}
+
+#ifdef GB_THREADED_AUDIO
+static void audio_thread_push_render(GB_gameboy_t *gb, const GB_render_job_t *job);
+static void audio_thread_push_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sample_t *output, unsigned arg, bool unfiltered);
+#endif
+
+static void render(GB_gameboy_t *gb)
+{
+    GB_render_job_t job;
+    render_capture(gb, &job);
+#ifdef GB_THREADED_AUDIO
+    /* Recording writes to output_file from render_process; keep that on the emulation thread */
+    if (gb->apu_output.audio_thread && !gb->apu_output.output_file) {
+        audio_thread_push_render(gb, &job);
+        return;
+    }
+    GB_apu_flush_audio_thread(gb);
+#endif
+    render_process(gb, &job);
 }
 
 static void update_square_sample(GB_gameboy_t *gb, GB_channel_t index, unsigned cycles)
@@ -2342,6 +2404,7 @@ void GB_apu_write(GB_gameboy_t *gb, uint8_t reg, uint8_t value)
 
 void GB_set_sample_rate(GB_gameboy_t *gb, unsigned sample_rate)
 {
+    GB_apu_flush_audio_thread(gb);
     if (gb->apu_output.sample_rate != sample_rate) {
         GB_ASSERT_NOT_RUNNING_OTHER_THREAD(gb)
     }
@@ -2361,6 +2424,7 @@ void GB_set_sample_rate(GB_gameboy_t *gb, unsigned sample_rate)
 
 void GB_set_sample_rate_by_clocks(GB_gameboy_t *gb, double cycles_per_sample)
 {
+    GB_apu_flush_audio_thread(gb);
     GB_ASSERT_NOT_RUNNING_OTHER_THREAD(gb)
     if (cycles_per_sample == 0) {
         GB_set_sample_rate(gb, 0);
@@ -2383,6 +2447,7 @@ unsigned GB_get_sample_rate(GB_gameboy_t *gb)
 
 void GB_apu_set_sample_callback(GB_gameboy_t *gb, GB_sample_callback_t callback)
 {
+    GB_apu_flush_audio_thread(gb);
     gb->apu_output.sample_callback = callback;
 }
 
@@ -2573,6 +2638,7 @@ void GB_apu_vgm_write(GB_gameboy_t *gb, uint8_t reg, uint8_t value)
 
 int GB_start_audio_recording(GB_gameboy_t *gb, const char *path, GB_audio_format_t format)
 {
+    GB_apu_flush_audio_thread(gb);
     if (format != GB_AUDIO_FORMAT_VGM && gb->apu_output.sample_rate == 0) {
         return EINVAL;
     }
@@ -2639,6 +2705,7 @@ int GB_start_audio_recording(GB_gameboy_t *gb, const char *path, GB_audio_format
 }
 int GB_stop_audio_recording(GB_gameboy_t *gb)
 {
+    GB_apu_flush_audio_thread(gb);
     if (!gb->apu_output.output_file) {
         int ret  = gb->apu_output.output_error ?: -1;
         gb->apu_output.output_error = 0;
@@ -2818,3 +2885,243 @@ bool GB_get_channel_edge_triggered(GB_gameboy_t *gb, GB_channel_t channel)
     gb->apu_output.edge_triggered[channel] = false;
     return edge_triggered;
 }
+
+/* Audio output thread (GB_THREADED_AUDIO).
+   The emulation thread produces events in a single-producer/single-consumer ring:
+   channel level changes (band-limited updates) and sample renders (render jobs). The
+   audio thread consumes them in order and runs exactly the code the emulation thread
+   would have run, so output is bit-identical. Ownership: while the thread exists, it is
+   the only user of apu_output.band_limited[] and apu_output.highpass_diff, and the only
+   caller of the sample callback; the emulation thread synchronizes with
+   GB_apu_flush_audio_thread before touching any of those. */
+#ifdef GB_THREADED_AUDIO
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
+
+#define GB_AUDIO_QUEUE_SIZE 4096 /* Power of two */
+#define GB_AUDIO_SPIN_LIMIT 20000
+
+typedef enum {
+    GB_AUDIO_EVENT_UPDATE,
+    GB_AUDIO_EVENT_UPDATE_UNFILTERED,
+    GB_AUDIO_EVENT_RENDER,
+} GB_audio_event_type_t;
+
+typedef struct {
+    uint8_t type;
+    uint8_t index;
+    unsigned arg;
+    GB_sample_t sample;
+} GB_audio_update_t;
+
+typedef struct {
+    uint8_t type;
+    union {
+        GB_audio_update_t update;
+        GB_render_job_t render;
+    };
+} GB_audio_event_t;
+
+#define GB_AUDIO_PUBLISH_BATCH 32 /* Updates are published in batches; renders publish immediately */
+#define GB_CACHE_LINE 64
+
+struct GB_audio_thread_s {
+    /* Emulation thread (producer) side */
+    _Alignas(GB_CACHE_LINE) unsigned producer_head; /* Next slot to fill */
+    unsigned producer_cached_tail;
+    unsigned unpublished;
+    GB_gameboy_t *gb;
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    /* Shared indices, each on its own cache line to avoid ping-ponging */
+    _Alignas(GB_CACHE_LINE) _Atomic unsigned head; /* Published by the producer */
+    _Alignas(GB_CACHE_LINE) _Atomic unsigned tail; /* Published by the consumer */
+    _Alignas(GB_CACHE_LINE) atomic_bool sleeping;
+    atomic_bool quit;
+    /* Audio thread (consumer) side */
+    _Alignas(GB_CACHE_LINE) unsigned consumer_cached_head;
+    _Alignas(GB_CACHE_LINE) GB_audio_event_t events[GB_AUDIO_QUEUE_SIZE];
+};
+
+static inline void cpu_relax(void)
+{
+#if defined(__aarch64__) || (defined(__arm__) && (__ARM_ARCH >= 7))
+    __asm__ volatile("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause");
+#endif
+}
+
+static void process_audio_event(GB_gameboy_t *gb, const GB_audio_event_t *event)
+{
+    switch ((GB_audio_event_type_t)event->type) {
+        case GB_AUDIO_EVENT_UPDATE:
+            band_limited_update(&gb->apu_output.band_limited[event->update.index], &event->update.sample, event->update.arg);
+            break;
+        case GB_AUDIO_EVENT_UPDATE_UNFILTERED:
+            band_limited_update_unfiltered(&gb->apu_output.band_limited[event->update.index], &event->update.sample, event->update.arg);
+            break;
+        case GB_AUDIO_EVENT_RENDER:
+            render_process(gb, &event->render);
+            break;
+    }
+}
+
+static void *audio_thread_main(void *context)
+{
+    struct GB_audio_thread_s *thread = context;
+    unsigned tail = atomic_load_explicit(&thread->tail, memory_order_relaxed);
+    unsigned spins = 0;
+    while (true) {
+        if (tail == thread->consumer_cached_head) {
+            thread->consumer_cached_head = atomic_load_explicit(&thread->head, memory_order_acquire);
+        }
+        if (tail != thread->consumer_cached_head) {
+            do {
+                process_audio_event(thread->gb, &thread->events[tail & (GB_AUDIO_QUEUE_SIZE - 1)]);
+                tail++;
+            } while (tail != thread->consumer_cached_head);
+            atomic_store_explicit(&thread->tail, tail, memory_order_release);
+            spins = 0;
+            continue;
+        }
+        if (atomic_load_explicit(&thread->quit, memory_order_acquire)) break;
+        /* Events arrive every few microseconds while emulating; only sleep between frames */
+        if (++spins < GB_AUDIO_SPIN_LIMIT) {
+            cpu_relax();
+            continue;
+        }
+        spins = 0;
+        pthread_mutex_lock(&thread->lock);
+        atomic_store(&thread->sleeping, true);
+        atomic_thread_fence(memory_order_seq_cst);
+        if (atomic_load_explicit(&thread->head, memory_order_relaxed) == tail &&
+            !atomic_load_explicit(&thread->quit, memory_order_relaxed)) {
+            pthread_cond_wait(&thread->wake, &thread->lock);
+        }
+        atomic_store(&thread->sleeping, false);
+        pthread_mutex_unlock(&thread->lock);
+    }
+    return NULL;
+}
+
+static void audio_thread_publish(struct GB_audio_thread_s *thread)
+{
+    thread->unpublished = 0;
+    atomic_store_explicit(&thread->head, thread->producer_head, memory_order_release);
+    /* Pairs with the fence the audio thread executes before deciding to sleep */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (unlikely(atomic_load_explicit(&thread->sleeping, memory_order_relaxed))) {
+        pthread_mutex_lock(&thread->lock);
+        pthread_cond_signal(&thread->wake);
+        pthread_mutex_unlock(&thread->lock);
+    }
+}
+
+static GB_audio_event_t *audio_thread_reserve(struct GB_audio_thread_s *thread)
+{
+    unsigned head = thread->producer_head;
+    if (unlikely(head - thread->producer_cached_tail >= GB_AUDIO_QUEUE_SIZE)) {
+        if (thread->unpublished) {
+            audio_thread_publish(thread);
+        }
+        while (head - (thread->producer_cached_tail = atomic_load_explicit(&thread->tail, memory_order_acquire)) >= GB_AUDIO_QUEUE_SIZE) {
+            cpu_relax(); /* Queue full; everything is published so the audio thread is awake */
+        }
+    }
+    return &thread->events[head & (GB_AUDIO_QUEUE_SIZE - 1)];
+}
+
+static void audio_thread_push_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sample_t *output, unsigned arg, bool unfiltered)
+{
+    struct GB_audio_thread_s *thread = gb->apu_output.audio_thread;
+    GB_audio_event_t *event = audio_thread_reserve(thread);
+    event->type = unfiltered? GB_AUDIO_EVENT_UPDATE_UNFILTERED : GB_AUDIO_EVENT_UPDATE;
+    event->update.index = index;
+    event->update.arg = arg;
+    event->update.sample = *output;
+    thread->producer_head++;
+    if (++thread->unpublished >= GB_AUDIO_PUBLISH_BATCH) {
+        audio_thread_publish(thread);
+    }
+}
+
+static void audio_thread_push_render(GB_gameboy_t *gb, const GB_render_job_t *job)
+{
+    struct GB_audio_thread_s *thread = gb->apu_output.audio_thread;
+    GB_audio_event_t *event = audio_thread_reserve(thread);
+    event->type = GB_AUDIO_EVENT_RENDER;
+    event->render = *job;
+    thread->producer_head++;
+    audio_thread_publish(thread);
+}
+
+void GB_apu_flush_audio_thread(GB_gameboy_t *gb)
+{
+    struct GB_audio_thread_s *thread = gb->apu_output.audio_thread;
+    if (!thread) return;
+    if (thread->unpublished || atomic_load_explicit(&thread->head, memory_order_relaxed) != thread->producer_head) {
+        audio_thread_publish(thread);
+    }
+    unsigned head = thread->producer_head;
+    unsigned spins = 0;
+    while (atomic_load_explicit(&thread->tail, memory_order_acquire) != head) {
+        if (++spins & 0xFFF) {
+            cpu_relax();
+        }
+        else {
+            sched_yield();
+        }
+    }
+    thread->producer_cached_tail = head;
+}
+
+void GB_set_audio_thread_enabled(GB_gameboy_t *gb, bool enabled)
+{
+    if (enabled == (gb->apu_output.audio_thread != NULL)) return;
+    if (enabled) {
+        struct GB_audio_thread_s *thread = NULL;
+        if (posix_memalign((void **)&thread, GB_CACHE_LINE, sizeof(*thread))) return;
+        memset(thread, 0, sizeof(*thread));
+        thread->gb = gb;
+        pthread_mutex_init(&thread->lock, NULL);
+        pthread_cond_init(&thread->wake, NULL);
+        if (pthread_create(&thread->thread, NULL, audio_thread_main, thread)) {
+            pthread_cond_destroy(&thread->wake);
+            pthread_mutex_destroy(&thread->lock);
+            free(thread);
+            return;
+        }
+        gb->apu_output.audio_thread = thread;
+    }
+    else {
+        struct GB_audio_thread_s *thread = gb->apu_output.audio_thread;
+        GB_apu_flush_audio_thread(gb);
+        pthread_mutex_lock(&thread->lock);
+        atomic_store(&thread->quit, true);
+        pthread_cond_signal(&thread->wake);
+        pthread_mutex_unlock(&thread->lock);
+        pthread_join(thread->thread, NULL);
+        pthread_cond_destroy(&thread->wake);
+        pthread_mutex_destroy(&thread->lock);
+        free(thread);
+        gb->apu_output.audio_thread = NULL;
+    }
+}
+
+bool GB_is_audio_thread_enabled(GB_gameboy_t *gb)
+{
+    return gb->apu_output.audio_thread != NULL;
+}
+#else
+void GB_set_audio_thread_enabled(GB_gameboy_t *gb, bool enabled)
+{
+}
+
+bool GB_is_audio_thread_enabled(GB_gameboy_t *gb)
+{
+    return false;
+}
+#endif

@@ -27,5 +27,11 @@ SOURCES_C   := $(CORE_DIR)/Core/gb.c \
 
 CFLAGS += -DGB_DISABLE_TIMEKEEPING -DGB_DISABLE_REWIND -DGB_DISABLE_DEBUGGER -DGB_DISABLE_CHEATS
 
+# THREADED_AUDIO=1: run band-limited audio synthesis on a second thread (multi-core targets)
+ifeq ($(THREADED_AUDIO),1)
+CFLAGS += -DGB_THREADED_AUDIO -pthread
+LDFLAGS += -pthread
+endif
+
 
 SOURCES_CXX :=	
