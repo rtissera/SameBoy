@@ -1639,6 +1639,8 @@ static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
     if (gb->stopped) return 0;
     if (GB_is_dma_active(gb)) return 0;
     if (gb->wx_triggered) return 0;
+    /* Key bounce noise samples display_cycles, which a batched mode 3 does not step */
+    if (!gb->joypad_is_stable) return 0;
     bool window = gb->wy_triggered && (gb->io_registers[GB_IO_LCDC] & GB_LCDC_WIN_ENABLE);
     if (gb->wy_triggered) {
         if (window) {
@@ -1652,12 +1654,16 @@ static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
             }
         }
     }
+    /* The window only starts if WX is reached within the line */
+    if (window && gb->io_registers[GB_IO_WX] >= 166) {
+        window = false;
+    }
     uint8_t scx = gb->io_registers[GB_IO_SCX];
     unsigned length = 167 + (scx & 7);
     if (window) {
         length += 6;
     }
-    if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_OBJ_EN) {
+    if ((gb->io_registers[GB_IO_LCDC] & GB_LCDC_OBJ_EN) || GB_is_cgb(gb)) { /* the CGB fetches them even when disabled */
         /* Object penalty (Pan Docs): 6 dots per object, plus a wait for the background
            fetcher of 5 - (position within the tile) dots that only the first object of a
            given tile column pays. Columns follow the SCX alignment, then the window's once
@@ -1680,10 +1686,12 @@ static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
             else {
                 rel = x + scx;
             }
-            unsigned column = rel & ~7u;
+            unsigned column = x? rel & ~7u : ~1u;
             unsigned penalty = 6;
             if (x == 0) {
-                penalty = 11;
+                if (column != prev_column) {
+                    penalty = 11;
+                }
             }
             else if ((rel & 7) < 5 && column != prev_column) {
                 penalty = 11 - (rel & 7);
@@ -2101,7 +2109,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             gb->n_visible_objs = 0;
             gb->orig_n_visible_objs = 0;
             
-            if (gb->lazy_cpu_enabled && !GB_is_dma_active(gb) && !gb->oam_ppu_blocked) {
+            if (gb->lazy_cpu_enabled && !GB_is_dma_active(gb) && !gb->oam_ppu_blocked && gb->joypad_is_stable) {
                 /* Relaxed accuracy: the whole OAM scan happens at the start of mode 2 */
                 add_all_objects(gb);
                 gb->oam_search_index = 40;

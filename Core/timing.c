@@ -807,7 +807,7 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
     unsigned budget = max_lag;
     uint8_t ie = gb->interrupt_enable;
     uint8_t stat = gb->io_registers[GB_IO_STAT];
-    if ((ie & 3) && (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE)) {
+    if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) {
         /* Mode 0 / mode 2 STAT sources fire on every line, but only right after mode 3 /
            mode 0: from any other mode they are more than GB_LAZY_MAX_LAG cycles away */
         bool near = (ie & 2) && (((stat & 0x08) && (stat & 3) == 3) || ((stat & 0x20) && (stat & 3) == 0));
@@ -815,12 +815,22 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
             /* VBlank, STAT mode 1 and LYC fire at the start of a given line: only bound the
                window when that line is close */
             unsigned ly = gb->current_line;
-            unsigned lines = 154;
-            if ((ie & 1) || ((ie & 2) && (stat & 0x10))) {
-                lines = (144 + 154 - ly) % 154;
-            }
+            /* Line 144 also ends GB_run_frame, where the frontend changes the inputs: the CPU
+               must not be ahead there even without a VBlank interrupt */
+            unsigned lines = (144 + 154 - ly) % 154;
             if ((ie & 2) && (stat & 0x40) && gb->io_registers[GB_IO_LYC] < 154) {
-                lines = MIN(lines, (gb->io_registers[GB_IO_LYC] + 154 - ly) % 154);
+                /* LY reads 0 from early in line 153 on, so LYC = 0 matches there (and at line 0
+                   when the LCD was just turned on) */
+                unsigned lyc = gb->io_registers[GB_IO_LYC];
+                lines = MIN(lines, (lyc + 154 - ly) % 154);
+                if (lyc == 0) {
+                    lines = MIN(lines, (153 + 154 - ly) % 154);
+                }
+            }
+            if ((ie & 2) && (stat & 0x20)) {
+                /* Mode 2 source from VBlank: line 0 (and line 144, as VBlank starts) */
+                lines = MIN(lines, (154 - ly) % 154);
+                lines = MIN(lines, (144 + 154 - ly) % 154);
             }
             if (lines <= 1) {
                 near = true;
@@ -835,8 +845,24 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
             budget = MIN(budget, (unsigned)display >> !gb->cgb_double_speed);
         }
     }
+    else {
+        /* LCD off: the display still ends frames (GB_run_frame returns, inputs change) on
+           its own schedule; stop before that */
+        int32_t display = GB_display_trivial_budget(gb);
+        if (display <= 0) return 0;
+        budget = MIN(budget, (unsigned)display >> !gb->cgb_double_speed);
+    }
+    /* Timer: TIMA overflows on a known DIV edge; stop before it (taking the timer interrupt
+       late changes how far a busy loop got, which games use as a random seed or counter) */
+    if ((ie & 4) && (gb->io_registers[GB_IO_TAC] & 4)) {
+        if (gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
+        unsigned period = TAC_TRIGGER_BITS[gb->io_registers[GB_IO_TAC] & 3] * 2;
+        unsigned distance = div_edge_distance(gb->div_counter, period) + (0xFF - gb->io_registers[GB_IO_TIMA]) * period;
+        if (distance <= 8) return 0;
+        budget = MIN(budget, distance - 8);
+    }
     /* Serial: only an internally clocked transfer can complete (and interrupt) on its own */
-    if ((ie & 8) && (gb->io_registers[GB_IO_SC] & 0x81) == 0x81) {
+    if ((ie & 8) &&(gb->io_registers[GB_IO_SC] & 0x81) == 0x81) {
         /* The serial interrupt can only be raised on a serial clock edge (a DIV bit falling):
            stop before the next one */
         unsigned distance = div_edge_distance(gb->div_counter, (gb->serial_mask & -gb->serial_mask) * 2);
