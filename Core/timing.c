@@ -662,6 +662,19 @@ void GB_advance_cycles(GB_gameboy_t *gb, unsigned cycles)
 
 #define GB_HALT_BATCH_MAX 60
 
+/* Whether advancing n M-cycles at once would skip an APU run that must happen at its exact
+   cycle. Halted, the sample and render cadence does not need one: a single GB_apu_run over
+   the whole batch renders every due sample at its own position (bit-identical over the
+   regression set); only the per-cycle channel conditions (sweep, channel 1 restart, wave
+   channel reads) still do. Running (lazy CPU windows), keep the full condition. */
+static inline bool batch_needs_apu_run(GB_gameboy_t *gb, bool halted, unsigned apu_step, unsigned sample_step, unsigned n)
+{
+    if (halted) {
+        return GB_apu_needs_run(gb, 0, 0);
+    }
+    return GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step * n, gb->apu_output.sample_cycles + sample_step * n);
+}
+
 /* Number of upcoming M-cycles during which no unit needs per-step work and no enabled
    interrupt can be raised, so that advancing them in a single GB_advance_cycles call is
    equivalent. Used for HALT batching (halted) and for the lazy CPU (running). */
@@ -683,7 +696,7 @@ static unsigned event_budget(GB_gameboy_t *gb, bool halted)
        while the wave channel forces per-cycle APU runs), or a non-trivial PPU step */
     const unsigned apu_step = 1 << !gb->cgb_double_speed;
     const unsigned sample_step = (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
-    if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step, gb->apu_output.sample_cycles + sample_step)) return 0;
+    if (batch_needs_apu_run(gb, halted, apu_step, sample_step, 1)) return 0;
     /* GB_advance_cycles units per iteration (4 CPU cycles, doubled when not in double speed) */
     const unsigned units = gb->cgb_double_speed? 4 : 8;
     int32_t display_budget = GB_display_trivial_budget(gb);
@@ -756,13 +769,14 @@ static unsigned event_budget(GB_gameboy_t *gb, bool halted)
         }
     }
     
-    /* APU: no run may be triggered during the batch. The timers loop adds these per M-cycle;
-       the condition is monotonic in n, so search the largest n that keeps it false. */
-    if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step * n, gb->apu_output.sample_cycles + sample_step * n)) {
+    /* APU: no run may be triggered during the batch (see batch_needs_apu_run). The timers
+       loop adds these per M-cycle; the condition is monotonic in n, so search the largest n
+       that keeps it false. */
+    if (batch_needs_apu_run(gb, halted, apu_step, sample_step, n)) {
         unsigned low = 1, high = n; /* needs_run(low) is false, needs_run(high) is true */
         while (high - low > 1) {
             unsigned mid = (low + high) / 2;
-            if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step * mid, gb->apu_output.sample_cycles + sample_step * mid)) {
+            if (batch_needs_apu_run(gb, halted, apu_step, sample_step, mid)) {
                 high = mid;
             }
             else {
@@ -943,6 +957,11 @@ static void halt_verify_trap(void)
     abort();
 }
 
+static void halt_verify_ignore_sample(GB_gameboy_t *gb, GB_sample_t *sample)
+{
+    (void)gb; (void)sample;
+}
+
 static void halt_batch_reference(GB_gameboy_t *gb, unsigned iterations)
 {
     /* Exactly what GB_cpu_run does for each halted iteration that doesn't wake up */
@@ -973,7 +992,7 @@ void GB_halt_batch(GB_gameboy_t *gb, unsigned iterations)
     memcpy(reference, gb, sizeof(*gb));
     /* Any callback firing during a batch is a failure */
     reference->vblank_callback = (void *)halt_verify_trap;
-    reference->apu_output.sample_callback = (void *)halt_verify_trap;
+    reference->apu_output.sample_callback = halt_verify_ignore_sample; /* Batches may render samples */
     reference->lcd_line_callback = (void *)halt_verify_trap;
     reference->rumble_callback = (void *)halt_verify_trap;
     reference->infrared_callback = (void *)halt_verify_trap;
