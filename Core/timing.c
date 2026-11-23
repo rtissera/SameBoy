@@ -888,12 +888,27 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
 
 /* Number of M-cycles that can be advanced in one GB_advance_cycles call while keeping the
    units exact relative to each other: never more than GB_LAZY_CHUNK (so the PPU crosses at
-   most one line boundary per call), and ending exactly where the APU guard would fire or
-   at the next DIV-APU edge, so sample renders and APU events keep their exact cycle. */
+   most one line boundary per call; display_run_full cannot take more, 64 overflows its
+   stack), and ending at the next DIV-APU edge so APU events keep their exact cycle.
+   With GB_LAZY_APU_BATCH, chunks run through audio samples like HALT batches do: the
+   picture and emulated state are unchanged, the band-limited output may shift slightly
+   (fast mode only; measured 84/388 real games, median 0.36% RMS, mostly closer to exact
+   mode). Set it to 0 for chunks cut at every sample render as before. */
+#ifndef GB_LAZY_CHUNK
 #define GB_LAZY_CHUNK 16
+#endif
+#ifndef GB_LAZY_APU_BATCH
+#define GB_LAZY_APU_BATCH 1
+#endif
 static unsigned lazy_chunk_limit(GB_gameboy_t *gb)
 {
     unsigned limit = GB_LAZY_CHUNK;
+#if GB_LAZY_APU_BATCH
+    /* Same as HALT batches (see batch_needs_apu_run): one GB_apu_run at the end of the
+       chunk renders every sample due within it at its own position; only the per-cycle
+       channel conditions need the APU stepped one M-cycle at a time */
+    if (GB_apu_needs_run(gb, 0, 0)) return 1;
+#else
     const unsigned apu_step = 1 << !gb->cgb_double_speed;
     const unsigned sample_step = (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
     if (GB_apu_needs_run(gb, gb->apu.apu_cycles + apu_step, gb->apu_output.sample_cycles + sample_step)) return 1;
@@ -904,6 +919,7 @@ static unsigned lazy_chunk_limit(GB_gameboy_t *gb)
     if (used < gb->apu_output.max_cycles_per_sample) {
         limit = MIN(limit, (gb->apu_output.max_cycles_per_sample - used + apu_step - 1) / apu_step);
     }
+#endif
     uint16_t apu_bit = gb->cgb_double_speed? 0x2000 : 0x1000;
     limit = MIN(limit, (apu_bit - (gb->div_counter & (apu_bit - 1)) + 3) / 4);
     /* Units that are not batch-safe in their current state */
