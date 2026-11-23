@@ -1807,6 +1807,7 @@ static void GB_reset_internal(GB_gameboy_t *gb, bool quick)
     
     gb->magic = GB_state_magic();
     request_boot_rom(gb);
+    GB_rebuild_cpu_pages(gb);
     GB_rewind_push(gb);
 }
 

@@ -783,7 +783,65 @@ void GB_set_read_memory_callback(GB_gameboy_t *gb, GB_read_memory_callback_t cal
         GB_ASSERT_NOT_RUNNING_OTHER_THREAD(gb)
     }
     gb->read_memory_callback = callback;
+    GB_rebuild_cpu_pages(gb);
 }
+
+static bool cart_is_plain(GB_gameboy_t *gb)
+{
+    /* Cartridges whose ROM/RAM accesses no other unit observes (the MBC3 RTC counts seconds) */
+    switch (gb->cartridge_type->mbc_type) {
+        case GB_NO_MBC:
+        case GB_MBC1:
+        case GB_MBC2:
+        case GB_MBC3:
+        case GB_MBC5:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void GB_rebuild_cpu_pages(GB_gameboy_t *gb)
+{
+    memset(gb->cpu_read_page, 0, sizeof(gb->cpu_read_page));
+    gb->cpu_page_main_bus = 0;
+    gb->lazy_private_pages = 0;
+    if (!gb->cartridge_type) return;
+    gb->lazy_private_pages = 0x7000; /* WRAM and its echo up to 0xEFFF (0xF000-0xFDFF: see lazy_address_is_private) */
+    if (cart_is_plain(gb)) {
+        gb->lazy_private_pages |= 0x0CFF; /* ROM and cartridge RAM */
+    }
+    if (gb->read_memory_callback) return;
+    /* ROM: same address computation as read_rom / read_mbc_rom, valid page by page since
+       rom_size is a power of 2 of at least 16 KiB */
+    if (gb->rom && gb->rom_size >= 0x4000 && !(gb->rom_size & (gb->rom_size - 1))) {
+        for (unsigned page = 0; page < 8; page++) {
+            if (page == 0 && !gb->boot_rom_finished) continue;
+            unsigned bank = (page & 4)? gb->mbc_rom_bank : gb->mbc_rom0_bank;
+            gb->cpu_read_page[page] = gb->rom + ((((page & 3) << 12) + bank * 0x4000) & (gb->rom_size - 1));
+            gb->cpu_page_main_bus |= 1 << page;
+        }
+    }
+    if (gb->ram) {
+        gb->cpu_read_page[0xC] = gb->ram;
+        gb->cpu_read_page[0xD] = gb->ram + gb->cgb_ram_bank * 0x1000;
+        if (!GB_is_cgb(gb)) {
+            gb->cpu_page_main_bus |= 0x3000; /* The CGB has WRAM on its own bus */
+        }
+    }
+}
+
+#ifdef GB_PAGE_VERIFY
+void GB_verify_cpu_page_read(GB_gameboy_t *gb, uint16_t addr, uint8_t data)
+{
+    uint8_t ref = read_map[addr >> 12](gb, addr);
+    if (ref != data || !gb->boot_rom_finished && addr < 0x900 || gb->read_memory_callback ||
+        ((gb->cpu_page_main_bus >> (addr >> 12)) & 1) != (bus_for_addr(gb, addr) == GB_BUS_MAIN)) {
+        fprintf(stderr, "cpu page mismatch at %04X: %02X vs %02X\n", addr, data, ref);
+        abort();
+    }
+}
+#endif
 
 uint8_t GB_read_memory(GB_gameboy_t *gb, uint16_t addr)
 {
@@ -1651,6 +1709,7 @@ static void write_high_memory(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
 
             case GB_IO_BANK:
                 gb->boot_rom_finished |= value & 1;
+                GB_rebuild_cpu_pages(gb);
                 return;
 
             case GB_IO_KEY0:
@@ -1675,6 +1734,7 @@ static void write_high_memory(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
                     if (!gb->cgb_ram_bank) {
                         gb->cgb_ram_bank++;
                     }
+                    GB_rebuild_cpu_pages(gb);
                     gb->io_registers[GB_IO_SVBK] = value | ~0x7;
                 }
                 return;

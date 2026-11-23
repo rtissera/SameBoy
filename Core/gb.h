@@ -852,6 +852,12 @@ struct GB_gameboy_internal_s {
            (GB_display_relaxed_mode3_write) */
         bool relaxed_mode3_pending;
         uint8_t relaxed_mode3_window_y;
+        /* CPU memory page table (GB_rebuild_cpu_pages), one entry per 4 KiB page: a direct
+           read pointer where a plain read has no side effect (ROM, WRAM), or NULL. Rebuilt
+           whenever the mapping changes (MBC, SVBK, boot ROM, reset, state load). */
+        const uint8_t *cpu_read_page[16];
+        uint16_t cpu_page_main_bus;   /* Pages whose reads go through the main bus (open bus) */
+        uint16_t lazy_private_pages;  /* Pages only the CPU can observe (see lazy_address_is_private) */
         unsigned cycles_since_run; // How many cycles have passed since the last call to GB_run(), in 8MHz units
         double clock_multiplier;
         GB_rumble_mode_t rumble_mode;
@@ -1118,38 +1124,37 @@ static inline bool GB_apu_needs_run(const GB_gameboy_t *gb, unsigned apu_cycles,
 
 internal void GB_cpu_lazy_flush(GB_gameboy_t *gb);
 
+internal void GB_rebuild_cpu_pages(GB_gameboy_t *gb);
+#ifdef GB_PAGE_VERIFY
+internal void GB_verify_cpu_page_read(GB_gameboy_t *gb, uint16_t addr, uint8_t data);
+#endif
+
 /* CPU-side fast path of GB_read_memory for ROM and WRAM, the bulk of CPU reads: same
    result and side effects as the full path when no OAM DMA is running (the only source of
-   bus conflicts for these regions), no read callback is set and the boot ROM is unmapped. */
+   bus conflicts for these regions). Mapped pages (cpu_read_page) are only set while no
+   read callback is installed and outside of the boot ROM. */
 static inline uint8_t GB_read_memory_fast(GB_gameboy_t *gb, uint16_t addr)
 {
 #if defined(GB_DISABLE_DEBUGGER) && defined(GB_DISABLE_CHEATS)
-    if (likely(gb->dma_current_dest == 0xA1 && !gb->read_memory_callback)) {
-        uint8_t data;
-        if (addr < 0x8000) {
-            if (unlikely(!gb->boot_rom_finished || !gb->rom_size)) goto slow;
-            unsigned bank = (addr & 0x4000)? gb->mbc_rom_bank : gb->mbc_rom0_bank;
-            data = gb->rom[((addr & 0x3FFF) + bank * 0x4000) & (gb->rom_size - 1)];
-        }
-        else if (addr >= 0xC000 && addr < 0xE000) {
-            data = gb->ram[(addr & 0x0FFF) + ((addr & 0x1000)? gb->cgb_ram_bank * 0x1000 : 0)];
-            if (GB_is_cgb_inline(gb)) return data; /* WRAM is on its own bus */
-        }
-        else {
-            goto slow;
-        }
-        /* Main bus: same open bus bookkeeping as GB_read_memory */
-        if (unlikely(gb->returned_open_bus)) {
-            gb->returned_open_bus = false;
-        }
-        else {
-            gb->data_bus = data;
-            gb->data_bus_decay_countdown = gb->data_bus_decay;
-            gb->lazy_bus_mark = gb->lazy_deferred_cycles;
+    const uint8_t *page = gb->cpu_read_page[addr >> 12];
+    if (likely(page && gb->dma_current_dest == 0xA1)) {
+        uint8_t data = page[addr & 0xFFF];
+#ifdef GB_PAGE_VERIFY
+        GB_verify_cpu_page_read(gb, addr, data);
+#endif
+        if ((gb->cpu_page_main_bus >> (addr >> 12)) & 1) {
+            /* Main bus: same open bus bookkeeping as GB_read_memory */
+            if (unlikely(gb->returned_open_bus)) {
+                gb->returned_open_bus = false;
+            }
+            else {
+                gb->data_bus = data;
+                gb->data_bus_decay_countdown = gb->data_bus_decay;
+                gb->lazy_bus_mark = gb->lazy_deferred_cycles;
+            }
         }
         return data;
     }
-slow:
 #endif
     return GB_read_memory(gb, addr);
 }

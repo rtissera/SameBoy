@@ -1383,6 +1383,7 @@ static int load_state_internal(GB_gameboy_t *gb, virtual_file_t *file)
     GB_rewind_invalidate_for_backstepping(gb);
     gb->apu_output.sample_fraction = 0;
     GB_apu_invalidate_levels(gb);
+    GB_rebuild_cpu_pages(gb);
     return 0;
 }
 

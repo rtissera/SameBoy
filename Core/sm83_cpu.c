@@ -88,28 +88,13 @@ static const conflict_t sgb_conflict_map[0x80] = {
    when the CPU touches observable memory, or before the deferred amount would reach the next
    hardware event (GB_lazy_cpu_budget: PPU/timer/APU/serial/... events). Interrupts are still
    detected in time since IF can only gain an enabled bit at such an event. */
-static inline bool lazy_cart_is_plain(GB_gameboy_t *gb)
-{
-    /* The MBC3 RTC counts seconds: a lag of at most GB_LAZY_MAX_LAG CPU cycles is not observable */
-    const GB_cartridge_t *cart = gb->cartridge_type;
-    switch (cart->mbc_type) {
-        case GB_NO_MBC:
-        case GB_MBC1:
-        case GB_MBC2:
-        case GB_MBC3:
-        case GB_MBC5:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static inline bool lazy_address_is_private(GB_gameboy_t *gb, uint16_t addr)
 {
-    if (addr < 0x8000) return lazy_cart_is_plain(gb);  /* ROM reads, MBC register writes */
-    if (addr < 0xA000) return false;                    /* VRAM */
-    if (addr < 0xC000) return lazy_cart_is_plain(gb);  /* Cartridge RAM */
-    if (addr < 0xFE00) return true;                     /* WRAM and echo */
+    /* ROM reads and MBC register writes, cartridge RAM (plain cartridges, see cart_is_plain
+       in memory.c), WRAM and its echo: page mask from GB_rebuild_cpu_pages */
+    if ((gb->lazy_private_pages >> (addr >> 12)) & 1) return true;
+    if (addr < 0xF000) return false;                    /* VRAM, other cartridges */
+    if (addr < 0xFE00) return true;                     /* Echo */
     if (addr < 0xFF80) return false;                    /* OAM, unusable range, I/O */
     return addr != 0xFFFF;                              /* HRAM, but not IE */
 }

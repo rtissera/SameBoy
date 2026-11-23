@@ -42,7 +42,7 @@ const GB_cartridge_t GB_cart_defs[256] = {
     {  GB_HUC1  , true , true , false, false}, // FFh  HuC1+RAM+BATTERY
 };
 
-void GB_update_mbc_mappings(GB_gameboy_t *gb)
+static void update_mbc_mappings(GB_gameboy_t *gb)
 {
     switch (gb->cartridge_type->mbc_type) {
         case GB_NO_MBC: return;
@@ -152,6 +152,12 @@ void GB_update_mbc_mappings(GB_gameboy_t *gb)
             break;
         nodefault;
     }
+}
+
+void GB_update_mbc_mappings(GB_gameboy_t *gb)
+{
+    update_mbc_mappings(gb);
+    GB_rebuild_cpu_pages(gb);
 }
 
 void GB_configure_cart(GB_gameboy_t *gb)
@@ -289,4 +295,5 @@ void GB_reset_mbc(GB_gameboy_t *gb)
     else {
         gb->mbc_rom_bank = 1;
     }
+    GB_rebuild_cpu_pages(gb);
 }
