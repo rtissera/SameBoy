@@ -1058,8 +1058,71 @@ static uint8_t read_wave_sample_bus(GB_gameboy_t *gb)
     return gb->io_registers[GB_IO_WAV_START + (gb->address_bus & 0xF)];
 }
 
+/* Set to 1 to replay on every APU run during a chunk (bit-identical audio, slower). By
+   default only the two run-boundary sensitive states replay: a pending DMG noise delayed
+   start and a pulsed wave channel that is enabled but silent (it samples the address bus). */
+#ifndef GB_REPLAY_ALL
+#define GB_REPLAY_ALL 0
+#endif
+
+/* Lazy CPU chunks advance the timers by several DIV steps before the APU runs. Where the
+   APU runs matters for the audio: renders happen at run boundaries (when sample_cycles
+   is due, or at max_cycles_per_sample splits, using the sample_cycles value of the run's
+   end), and each render rebases sample_fraction, the phase that positions the following
+   level changes (clamped to 0 when less than a sample elapsed). Replay the pending steps
+   and run the APU wherever advancing one step at a time would have, so the output stays
+   bit-identical. Both counters only grow between runs, so steps that were pending before
+   the chunk never trigger a run here. */
+static noinline void apu_replay_pending(GB_gameboy_t *gb)
+{
+    gb->lazy_apu_replay = false;
+    const unsigned apu_step = 1 << !gb->cgb_double_speed;
+    const unsigned sample_step = (gb->apu_output.sample_rate << !gb->cgb_double_speed) << 1;
+    const uint32_t clock_rate = gb->clock_rate;
+    unsigned steps = gb->apu.apu_cycles / apu_step;
+    unsigned apu_cycles = gb->apu.apu_cycles - steps * apu_step;
+    uint32_t sample_cycles = gb->apu_output.sample_cycles - steps * sample_step;
+    while (steps) {
+        unsigned n = steps;
+        unsigned used = apu_cycles + gb->apu_output.cycles_since_render;
+        if (used < gb->apu_output.max_cycles_per_sample) {
+            n = MIN(n, (gb->apu_output.max_cycles_per_sample - used + apu_step - 1) / apu_step);
+        }
+        else {
+            n = 1;
+        }
+        if (sample_step) {
+            if (sample_cycles < clock_rate) {
+                n = MIN(n, (clock_rate - sample_cycles + sample_step - 1) / sample_step);
+            }
+            else {
+                n = 1;
+            }
+        }
+        if (n == 0) n = 1;
+        apu_cycles += n * apu_step;
+        sample_cycles += n * sample_step;
+        steps -= n;
+        if (steps && GB_apu_needs_run(gb, apu_cycles, sample_cycles)) {
+            gb->apu.apu_cycles = apu_cycles;
+            gb->apu_output.sample_cycles = sample_cycles;
+            GB_apu_run(gb, false);
+            apu_cycles = gb->apu.apu_cycles;
+            sample_cycles = gb->apu_output.sample_cycles;
+        }
+    }
+    gb->apu.apu_cycles = apu_cycles;
+    gb->apu_output.sample_cycles = sample_cycles;
+    gb->lazy_apu_replay = true;
+}
+
 void GB_apu_run(GB_gameboy_t *gb, bool force)
 {
+    if (unlikely(gb->lazy_apu_replay) &&
+        (GB_REPLAY_ALL || gb->apu.noise_channel.dmg_delayed_start ||
+         (gb->model <= GB_MODEL_CGB_E && !gb->apu.is_active[GB_WAVE] && gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed))) {
+        apu_replay_pending(gb);
+    }
     uint32_t clock_rate = GB_get_clock_rate(gb);
     bool orig_force = force;
     

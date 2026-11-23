@@ -940,7 +940,13 @@ void GB_advance_cycles_chunked(GB_gameboy_t *gb, unsigned cycles, unsigned steps
     unsigned calls = 0;
     while (cycles) {
         unsigned chunk = MIN(cycles, lazy_chunk_limit(gb) * 4);
+#if GB_LAZY_APU_BATCH
+        gb->lazy_apu_replay = chunk > 4 && !gb->speed_switch_countdown && !gb->speed_switch_freeze && !gb->stopped;
         GB_advance_cycles(gb, chunk);
+        gb->lazy_apu_replay = false;
+#else
+        GB_advance_cycles(gb, chunk);
+#endif
         cycles -= chunk;
         calls++;
     }

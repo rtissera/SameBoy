@@ -882,6 +882,8 @@ struct GB_gameboy_internal_s {
         
         /* Band limited synthesis ring buffers (see GB_band_limited_buffers_t) */
         GB_band_limited_buffers_t band_limited_buffers[GB_N_CHANNELS];
+        /* Set while a lazy CPU chunk is applied (see apu_replay_pending) */
+        bool lazy_apu_replay;
    )
 };
     
