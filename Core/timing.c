@@ -823,8 +823,13 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
     uint8_t stat = gb->io_registers[GB_IO_STAT];
     if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) {
         /* Mode 0 / mode 2 STAT sources fire on every line, but only right after mode 3 /
-           mode 0: from any other mode they are more than GB_LAZY_MAX_LAG cycles away */
-        bool near = (ie & 2) && (((stat & 0x08) && (stat & 3) == 3) || ((stat & 0x20) && (stat & 3) == 0));
+           mode 0: from any other mode they are more than GB_LAZY_MAX_LAG cycles away.
+           HBlank starts in steps after mode 3: STAT reads mode 0 one dot before the mode 0
+           interrupt is raised (display state 22), and an armed HBlank HDMA starts two dots
+           later (state 33). Both must happen at their exact cycle. */
+        bool hblank_ahead = (stat & 3) == 3 || gb->display_state == 22;
+        bool near = ((ie & 2) && (((stat & 0x08) && hblank_ahead) || ((stat & 0x20) && (stat & 3) == 0))) ||
+                    (gb->hdma_on_hblank && (hblank_ahead || gb->display_state == 33));
         if (!near) {
             /* VBlank, STAT mode 1 and LYC fire at the start of a given line: only bound the
                window when that line is close */
@@ -868,8 +873,10 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
     }
     /* Timer: TIMA overflows on a known DIV edge; stop before it (taking the timer interrupt
        late changes how far a busy loop got, which games use as a random seed or counter) */
+    /* A pending reload raises the interrupt on its own, even with the timer just disabled
+       (a TAC write can increment TIMA into an overflow) */
+    if ((ie & 4) && gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
     if ((ie & 4) && (gb->io_registers[GB_IO_TAC] & 4)) {
-        if (gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
         unsigned period = TAC_TRIGGER_BITS[gb->io_registers[GB_IO_TAC] & 3] * 2;
         unsigned distance = div_edge_distance(gb->div_counter, period) + (0xFF - gb->io_registers[GB_IO_TIMA]) * period;
         if (distance <= 8) return 0;
@@ -931,6 +938,20 @@ static unsigned lazy_chunk_limit(GB_gameboy_t *gb)
         if ((is_sensing || gb->ir_warmup || gb->ir_decay) && !ir_batch_safe(gb)) return 1;
     }
     if (gb->div_state != 2 || gb->apu.pending_envelope_tick) return 1;
+    /* The display call that performs a scheduled WY check runs its remaining cycles without
+       batching (display_run_full). Stepping, that is the rest of one M-cycle; a chunk would
+       extend it and could make mode 3 take the per-dot path where the exact run batches. */
+    if (!gb->wy_triggered && gb->wy_check_scheduled) return 1;
+    /* display_run_full treats a call that crosses the line end, as measured from
+       cycles_for_line before HBlank resets it, as a mode 3 that never ended (display9).
+       Stepping cannot trigger it there; keep chunks short of that point. */
+    if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) {
+        const unsigned units = gb->cgb_double_speed? 4 : 8; /* display cycles per M-cycle */
+        int32_t room = 456 * 2 /* LINE_LENGTH */ - (int32_t)gb->cycles_for_line * 2 - gb->display_cycles;
+        if (room < (int32_t)(limit * units)) {
+            limit = room > (int32_t)units? room / units : 1;
+        }
+    }
     return MAX(limit, 1);
 }
 

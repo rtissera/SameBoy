@@ -308,6 +308,9 @@ static uint8_t read_vram(GB_gameboy_t *gb, uint16_t addr)
         return 0xFF;
     }
     if (unlikely(gb->display_state == 22)) {
+        if (unlikely(gb->relaxed_mode3_done)) {
+            GB_display_relaxed_mode3_replay(gb);
+        }
         if (!GB_is_cgb(gb)) {
             if (addr & 0x1000 && !(gb->last_tile_data_address & 0x1000)) {
                 addr &= ~0x1000; // TODO: verify
@@ -1502,7 +1505,26 @@ static void write_high_memory(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
                         GB_display_sync(gb);
                         GB_display_relaxed_mode3_write(gb);
                     }
+                    break;
+                case GB_IO_HDMA5:
+                    /* A general purpose DMA conflicts with the PPU's own VRAM fetches
+                       (addr_for_hdma_conflict), which only the per-dot path performs */
+                    if (!(value & 0x80)) {
+                        GB_display_sync(gb);
+                        GB_display_relaxed_mode3_write(gb);
+                    }
+                    break;
+                case GB_IO_DMA:
+                    /* OAM DMA blocks the object fetches of the rest of the line */
+                    GB_display_sync(gb);
+                    GB_display_relaxed_mode3_write(gb);
+                    break;
             }
+        }
+        /* Display states 44 and 45: relaxed one-go OAM scan (see GB_display_relaxed_oam_scan_rewind) */
+        if (unlikely((addr & 0xFF) == GB_IO_DMA && (gb->display_state == 44 || gb->display_state == 45))) {
+            GB_display_sync(gb);
+            GB_display_relaxed_oam_scan_rewind(gb);
         }
         
         /* Hardware registers */

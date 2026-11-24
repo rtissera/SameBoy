@@ -632,6 +632,9 @@ static void add_object_from_index(GB_gameboy_t *gb, unsigned index)
         gb->mode2_y_bus = oam_read(gb, index * 4);
         gb->mode2_x_bus = oam_read(gb, index * 4 + 1);
     }
+    else {
+        gb->oam_scan_during_dma = true;
+    }
 
     if (unlikely(gb->n_visible_objs == 10)) return;
     
@@ -1638,6 +1641,8 @@ static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
     if (gb->hdma_on) return 0;
     if (gb->stopped) return 0;
     if (GB_is_dma_active(gb)) return 0;
+    /* Objects found from the stale OAM bus have a position that render_line cannot see */
+    if (gb->oam_scan_during_dma) return 0;
     if (gb->wx_triggered) return 0;
     /* Key bounce noise samples display_cycles, which a batched mode 3 does not step */
     if (!gb->joypad_is_stable) return 0;
@@ -1686,7 +1691,9 @@ static inline uint16_t mode3_relaxed_length(GB_gameboy_t *gb)
             else {
                 rel = x + scx;
             }
-            unsigned column = x? rel & ~7u : ~1u;
+            /* An object at X = 0 always waits 11 dots, and the objects that follow in its
+               tile column (SCX aligned) then only pay 6 */
+            unsigned column = rel & ~7u;
             unsigned penalty = 6;
             if (x == 0) {
                 if (column != prev_column) {
@@ -1724,6 +1731,83 @@ static void update_frame_parity(GB_gameboy_t *gb)
     }
 }
 
+static void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force);
+
+/* Relaxed accuracy: a VRAM access during display state 22, right after a relaxed mode 3,
+   sees the addresses of the fetcher's last tile fetches (see read_vram), which only the per-dot
+   path tracks. Replay the line from its mode 3 start with the exact pixel FIFO (it renders the
+   same pixels), back to the same point. Called after GB_display_sync. */
+void GB_display_relaxed_mode3_replay(GB_gameboy_t *gb)
+{
+    gb->relaxed_mode3_done = false;
+    if (gb->display_state != 22) return;
+    int32_t elapsed = gb->mode3_batching_length * 2 + 2 + gb->display_cycles;
+    gb->cycles_for_line -= gb->mode3_batching_length + 1;
+    gb->n_visible_objs = gb->orig_n_visible_objs;
+    gb->window_y = gb->relaxed_mode3_window_y;
+    gb->disable_window_pixel_insertion_glitch = false;
+    fifo_clear(&gb->bg_fifo);
+    fifo_clear(&gb->oam_fifo);
+    fifo_push_bg_row(&gb->bg_fifo, 0, 0, 0, false, false);
+    gb->lcd_x = 0;
+    gb->position_in_line = -16;
+    gb->fetcher_state = GB_FETCHER_GET_TILE_T1;
+    gb->io_registers[GB_IO_STAT] |= 3;
+    gb->mode_for_interrupt = 3;
+    gb->vram_read_blocked = true;
+    gb->vram_write_blocked = true;
+    gb->oam_read_blocked = true;
+    gb->oam_write_blocked = true;
+    gb->display_state = 46;
+    gb->display_cycles = elapsed;
+    display_run_full(gb, 0, true);
+}
+
+/* Relaxed accuracy: the OAM scan was done in one go at the start of mode 2 (display states 44
+   and 45 sleep through the rest of it). An OAM DMA starting now changes what the remaining
+   entries read (the scan keeps the last values on its bus while DMA is active), so rebuild the
+   entries the stepped scan has read by now and resume it at the current entry. Called after
+   GB_display_sync, before the write that starts the DMA. */
+void GB_display_relaxed_oam_scan_rewind(GB_gameboy_t *gb)
+{
+    int32_t u; /* display cycles since the scan started (2 per dot) */
+    if (gb->display_state == 44) {
+        u = 76 * 2 + gb->display_cycles;
+    }
+    else if (gb->display_state == 45) {
+        u = 80 * 2 + gb->display_cycles;
+    }
+    else {
+        return;
+    }
+    if (u < 0) u = 0;
+    /* Entry i sleeps over (4i, 4i + 4]; the CGB reads it before its sleep, the DMG after */
+    int32_t index = u? (u + 3) / 4 - 1 : 0;
+    if (index > 39) index = 39;
+    gb->n_visible_objs = 0;
+    gb->vram_read_blocked = false;
+    gb->vram_write_blocked = false;
+    gb->cgb_palettes_blocked = false;
+    gb->oam_write_blocked = true;
+    unsigned last = GB_is_cgb(gb)? index + 1 : index;
+    for (unsigned i = 0; i < last; i++) {
+        add_object_from_index(gb, i);
+        if (i == 37) {
+            gb->vram_read_blocked = !GB_is_cgb(gb);
+            gb->oam_write_blocked = GB_is_cgb(gb);
+        }
+    }
+    if (!GB_is_cgb(gb)) {
+        gb->accessed_oam_row = index? ((index - 1) & ~1) * 4 + 8 : 0;
+    }
+    else {
+        gb->accessed_oam_row = -1;
+    }
+    gb->oam_search_index = index;
+    gb->display_state = 8;
+    gb->display_cycles = u - (index * 4 + 4);
+}
+
 /*
  TODO: It seems that the STAT register's mode bits are always "late" by 4 T-cycles.
        The PPU logic can be greatly simplified if that delay is simply emulated.
@@ -1738,7 +1822,9 @@ static void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force);
 void GB_display_relaxed_mode3_write(GB_gameboy_t *gb)
 {
     gb->relaxed_mode3_pending = false;
-    if (gb->display_state != 4 || gb->display_cycles > 0) return;
+    if ((gb->display_state != 4 && gb->display_state != 47) || gb->display_cycles > 0) return;
+    /* Still held after the forced sync: the exact batch completes now, the line is done */
+    if (gb->relaxed_mode3_long) return;
     int32_t elapsed = gb->display_cycles + gb->mode3_batching_length * 2;
     if (elapsed < 0) return;
     gb->cycles_for_line -= gb->mode3_batching_length;
@@ -1837,6 +1923,16 @@ void GB_display_run(GB_gameboy_t *gb, unsigned cycles, bool force)
 
 static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool force)
 {
+    if (unlikely(gb->relaxed_mode3_long) && gb->display_state == 47 &&
+        (force || (!gb->wy_triggered && gb->wy_check_scheduled)) &&
+        gb->display_cycles + (int32_t)cycles < 0) {
+        /* A forced run inside the exact batch window replays the line dot by dot: mode 3 ends
+           at its real length (see mode_3_start) */
+        unsigned extra = 300 - gb->mode3_batching_length;
+        gb->relaxed_mode3_long = false;
+        gb->cycles_for_line -= extra;
+        gb->display_cycles += extra * 2;
+    }
     if (gb->wy_triggered) {
         gb->wy_check_scheduled = false;
     }
@@ -1949,6 +2045,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
         GB_STATE(gb, display, 44);
         GB_STATE(gb, display, 45);
         GB_STATE(gb, display, 46);
+        GB_STATE(gb, display, 47);
     }
     
     gb->wy_check_modulo = cycles;
@@ -2108,6 +2205,7 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             GB_STAT_update(gb);
             gb->n_visible_objs = 0;
             gb->orig_n_visible_objs = 0;
+            gb->oam_scan_during_dma = false;
             
             if (gb->lazy_cpu_enabled && !GB_is_dma_active(gb) && !gb->oam_ppu_blocked && gb->joypad_is_stable) {
                 /* Relaxed accuracy: the whole OAM scan happens at the start of mode 2 */
@@ -2179,6 +2277,24 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             if (gb->lazy_cpu_enabled && (gb->mode3_batching_length = mode3_relaxed_length(gb))) {
                 gb->relaxed_mode3_pending = true;
                 gb->relaxed_mode3_window_y = gb->window_y;
+                if (mode3_batching_length(gb) == 300) {
+                    /* Without an HBlank interrupt, the exact path batches lines with objects or
+                       the window for 300 dots: until something syncs the PPU, mode 3 (STAT, VRAM
+                       and OAM blocking) lasts that long, and a sync replays the line dot by dot,
+                       ending mode 3 at its real length. Hold mode 3 for 300 dots the same way;
+                       display_run_full shortens it to the estimate on the first forced run. */
+                    gb->relaxed_mode3_long = true;
+                    gb->lcd_x = gb->position_in_line = 160;
+                    gb->cycles_for_line += 300;
+                    if (gb->sgb) {
+                        render_line_sgb(gb);
+                    }
+                    else {
+                        render_line(gb);
+                    }
+                    GB_SLEEP(gb, display, 47, 300);
+                    goto skip_slow_mode_3;
+                }
                 goto mode3_render_batched;
             }
             if ((gb->mode3_batching_length = mode3_batching_length(gb))) {
@@ -2373,7 +2489,22 @@ abort_fetching_object:
                 }
             }
 skip_slow_mode_3:
+            if (gb->relaxed_mode3_pending && !gb->relaxed_mode3_long &&
+                ((gb->io_registers[GB_IO_LCDC] & GB_LCDC_OBJ_EN) || GB_is_cgb(gb))) {
+                /* The per-dot path leaves the last fetched object's tile and attributes on the
+                   OAM bus, which a later OAM scan during DMA reads back (a held line that
+                   completes untouched is rendered in one go by the exact path too) */
+                for (unsigned i = 0; i < gb->orig_n_visible_objs; i++) {
+                    if (gb->objects_x[i] < 168) {
+                        gb->mode2_y_bus = gb->oam[gb->visible_objs[i] * 4 + 2];
+                        gb->object_flags = gb->oam[gb->visible_objs[i] * 4 + 3];
+                        break;
+                    }
+                }
+            }
+            gb->relaxed_mode3_done = gb->relaxed_mode3_pending && !gb->relaxed_mode3_long;
             gb->relaxed_mode3_pending = false;
+            gb->relaxed_mode3_long = false;
             gb->position_in_line = -16;
             gb->line_has_fractional_scrolling = false;
             
@@ -2431,6 +2562,7 @@ skip_slow_mode_3:
             
             gb->cycles_for_line++;
             GB_SLEEP(gb, display, 22, 1);
+            gb->relaxed_mode3_done = false;
             
             gb->io_registers[GB_IO_STAT] &= ~3;
             gb->mode_for_interrupt = 0;
