@@ -96,6 +96,10 @@ void GB_trigger_oam_bug(GB_gameboy_t *gb, uint16_t address)
     
     if (address >= 0xFE00 && address < 0xFF00) {
         GB_display_sync(gb);
+        if (unlikely(gb->display_state == 44 || gb->display_state == 45)) {
+            /* The corruption depends on the row the stepped OAM scan is reading */
+            GB_display_relaxed_oam_scan_rewind(gb);
+        }
         if (gb->accessed_oam_row != 0xFF && gb->accessed_oam_row >= 8) {
             uint16_t *base = (uint16_t *)(gb->oam + gb->accessed_oam_row);
             base[0] = bitwise_glitch(base[0],
@@ -198,6 +202,12 @@ void GB_trigger_oam_bug_read(GB_gameboy_t *gb, uint16_t address)
     if (GB_is_cgb(gb)) return;
     
     if (address >= 0xFE00 && address < 0xFF00) {
+        if (unlikely(gb->lazy_cpu_enabled)) {
+            GB_display_sync(gb);
+            if (gb->display_state == 44 || gb->display_state == 45) {
+                GB_display_relaxed_oam_scan_rewind(gb);
+            }
+        }
         if (gb->accessed_oam_row != 0xFF && gb->accessed_oam_row >= 8) {
             if ((gb->accessed_oam_row & 0x18) == 0x10) {
                 oam_bug_secondary_read_corruption(gb);
@@ -1521,8 +1531,13 @@ static void write_high_memory(GB_gameboy_t *gb, uint16_t addr, uint8_t value)
                     break;
             }
         }
-        /* Display states 44 and 45: relaxed one-go OAM scan (see GB_display_relaxed_oam_scan_rewind) */
-        if (unlikely((addr & 0xFF) == GB_IO_DMA && (gb->display_state == 44 || gb->display_state == 45))) {
+        /* Display states 44 and 45: relaxed one-go OAM scan (see GB_display_relaxed_oam_scan_rewind).
+           OAM DMA changes what the remaining entries read, the object size how they match, and a
+           double speed STAT write at the first entry raises the mode 2 interrupt (see GB_IO_STAT). */
+        if (unlikely((gb->display_state == 44 || gb->display_state == 45) &&
+                     ((addr & 0xFF) == GB_IO_DMA ||
+                      ((addr & 0xFF) == GB_IO_LCDC && ((gb->io_registers[GB_IO_LCDC] ^ value) & GB_LCDC_OBJ_SIZE)) ||
+                      ((addr & 0xFF) == GB_IO_STAT && gb->cgb_double_speed && (value & 0x20))))) {
             GB_display_sync(gb);
             GB_display_relaxed_oam_scan_rewind(gb);
         }

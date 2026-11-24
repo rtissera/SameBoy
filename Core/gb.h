@@ -855,6 +855,7 @@ struct GB_gameboy_internal_s {
         bool oam_scan_during_dma; /* This line's OAM scan read the bus while OAM DMA ran */
         bool relaxed_mode3_long; /* Relaxed mode 3 holds for 300 dots like the exact batch (display state 47) */
         bool relaxed_mode3_done; /* Display state 22 right after a relaxed mode 3 (GB_display_relaxed_mode3_replay) */
+        bool relaxed_window_step; /* The per-dot path would advance window_y where render_line does not */
         /* CPU memory page table (GB_rebuild_cpu_pages), one entry per 4 KiB page: a direct
            read pointer where a plain read has no side effect (ROM, WRAM), or NULL. Rebuilt
            whenever the mapping changes (MBC, SVBK, boot ROM, reset, state load). */

@@ -2277,6 +2277,12 @@ static noinline void display_run_full(GB_gameboy_t *gb, unsigned cycles, bool fo
             if (gb->lazy_cpu_enabled && (gb->mode3_batching_length = mode3_relaxed_length(gb))) {
                 gb->relaxed_mode3_pending = true;
                 gb->relaxed_mode3_window_y = gb->window_y;
+                /* render_line returns before its window logic when the background is not drawn
+                   (or nothing is rendered); the per-dot path still starts the window there */
+                gb->relaxed_window_step = (gb->disable_rendering || !gb->screen || gb->background_disabled ||
+                                           (!gb->cgb_mode && !(gb->io_registers[GB_IO_LCDC] & GB_LCDC_BG_EN))) &&
+                                          gb->wy_triggered && (gb->io_registers[GB_IO_LCDC] & GB_LCDC_WIN_ENABLE) &&
+                                          gb->io_registers[GB_IO_WX] >= 7 && gb->io_registers[GB_IO_WX] < 166;
                 if (mode3_batching_length(gb) == 300) {
                     /* Without an HBlank interrupt, the exact path batches lines with objects or
                        the window for 300 dots: until something syncs the PPU, mode 3 (STAT, VRAM
@@ -2503,6 +2509,9 @@ skip_slow_mode_3:
                 }
             }
             gb->relaxed_mode3_done = gb->relaxed_mode3_pending && !gb->relaxed_mode3_long;
+            if (gb->relaxed_mode3_done && gb->relaxed_window_step) {
+                gb->window_y++;
+            }
             gb->relaxed_mode3_pending = false;
             gb->relaxed_mode3_long = false;
             gb->position_in_line = -16;

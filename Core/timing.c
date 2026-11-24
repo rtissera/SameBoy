@@ -823,12 +823,15 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
     uint8_t stat = gb->io_registers[GB_IO_STAT];
     if (gb->io_registers[GB_IO_LCDC] & GB_LCDC_ENABLE) {
         /* Mode 0 / mode 2 STAT sources fire on every line, but only right after mode 3 /
-           mode 0: from any other mode they are more than GB_LAZY_MAX_LAG cycles away.
+           mode 0 (or a late mode 3): from any other mode they are more than GB_LAZY_MAX_LAG
+           cycles away.
            HBlank starts in steps after mode 3: STAT reads mode 0 one dot before the mode 0
            interrupt is raised (display state 22), and an armed HBlank HDMA starts two dots
            later (state 33). Both must happen at their exact cycle. */
         bool hblank_ahead = (stat & 3) == 3 || gb->display_state == 22;
-        bool near = ((ie & 2) && (((stat & 0x08) && hblank_ahead) || ((stat & 0x20) && (stat & 3) == 0))) ||
+        /* The mode 2 source fires at the next line start: from a late mode 3 (a long one, or
+           the relaxed 300-dot hold, display state 47) that can be less than GB_LAZY_MAX_LAG away */
+        bool near = ((ie & 2) && (((stat & 0x08) && hblank_ahead) || ((stat & 0x20) && ((stat & 3) == 0 || hblank_ahead)))) ||
                     (gb->hdma_on_hblank && (hblank_ahead || gb->display_state == 33));
         if (!near) {
             /* VBlank, STAT mode 1 and LYC fire at the start of a given line: only bound the
