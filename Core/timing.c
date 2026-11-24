@@ -815,9 +815,18 @@ bool GB_lazy_cpu_allowed(GB_gameboy_t *gb)
    visible as interrupt latency. VBlank and timer handlers tolerate it (a few dozen
    microseconds), but STAT interrupts drive HBlank VRAM copies and raster effects that must
    fit in their mode: while one is armed, the window ends before it can be raised. */
+static inline unsigned interrupt_budget(GB_gameboy_t *gb, unsigned max_lag) __attribute__((always_inline));
+
 unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
 {
     if (!GB_lazy_cpu_allowed(gb)) return 0;
+    return interrupt_budget(gb, max_lag);
+}
+
+/* CPU cycles (max_lag at most, a multiple of 4) during which no enabled interrupt can be
+   raised */
+static inline unsigned interrupt_budget(GB_gameboy_t *gb, unsigned max_lag)
+{
     unsigned budget = max_lag;
     uint8_t ie = gb->interrupt_enable;
     uint8_t stat = gb->io_registers[GB_IO_STAT];
@@ -910,7 +919,7 @@ unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag)
 #ifndef GB_LAZY_APU_BATCH
 #define GB_LAZY_APU_BATCH 1
 #endif
-static unsigned lazy_chunk_limit(GB_gameboy_t *gb)
+static inline __attribute__((always_inline)) unsigned lazy_chunk_limit(GB_gameboy_t *gb)
 {
     unsigned limit = GB_LAZY_CHUNK;
 #if GB_LAZY_APU_BATCH
@@ -982,6 +991,69 @@ void GB_advance_cycles_chunked(GB_gameboy_t *gb, unsigned cycles, unsigned steps
     gb->dma_cycles = 4;
 }
 
+
+/* HALT run-ahead (relaxed accuracy only)
+   A HALT batch stops at every non-trivial PPU step, APU run and DIV-APU edge, leaving the
+   CPU to step one M-cycle at a time across them (two GB_advance_cycles calls per M-cycle on
+   pre-CGB models). A halted CPU only observes IE & IF though: as long as no enabled
+   interrupt can be raised (the lazy CPU's bound, see interrupt_budget), none of these
+   iterations wakes up, and GB_advance_cycles_chunked crosses those events while keeping the
+   units exact relative to each other, as it does for the running lazy CPU. */
+#define GB_HALT_LAZY_MAX (32 * 4)
+
+unsigned GB_halt_lazy_iterations(GB_gameboy_t *gb)
+{
+#ifndef GB_DISABLE_DEBUGGER
+    return 0;
+#endif
+    if (!gb->lazy_cpu_enabled || !gb->halt_batching_allowed) return 0;
+    if (!gb->halted || gb->stopped || gb->just_halted || gb->ime_toggle || gb->pending_cycles) return 0;
+    if (gb->interrupt_enable & gb->io_registers[GB_IO_IF] & 0x1F) return 0;
+    if (GB_is_dma_active(gb) || gb->hdma_on || gb->hdma_in_progress) return 0;
+    if (gb->speed_switch_countdown || gb->speed_switch_halt_countdown || gb->speed_switch_freeze) return 0;
+    if (gb->printer_callback || gb->printer_done_callback || gb->accessory == GB_ACCESSORY_PRINTER) return 0;
+    if (gb->apu_output.output_file) return 0;
+    if (!gb->joypad_is_stable || gb->inputs_changed) return 0;
+    if (gb->div_state != 2 || gb->tima_reload_state != GB_TIMA_RUNNING) return 0;
+    if (gb->apu.pending_envelope_tick) return 0;
+    if ((gb->io_registers[GB_IO_SC] & 0x81) == 0x81) return 0;
+    if ((gb->io_registers[GB_IO_SC] & 0x80) && (gb->serial_transfer_bit_start_callback || gb->serial_transfer_bit_end_callback)) return 0;
+    /* Units needing per-M-cycle steps right now: stepping is as cheap */
+    if (lazy_chunk_limit(gb) < 2) return 0;
+    
+    unsigned n = interrupt_budget(gb, GB_HALT_LAZY_MAX) / 4;
+    if (n < 2) return 0;
+    
+    /* Same bounds as HALT batches: GB_timing_sync must keep returning early, and the RTC
+       stays below its next second (or host sync) boundary */
+    const unsigned units = gb->cgb_double_speed? 4 : 8;
+    if (gb->interrupt_enable & 0x10) {
+        if (gb->cycles_since_last_sync + units >= LCDC_PERIOD / 3) return 0;
+        n = MIN(n, (unsigned)((LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units));
+    }
+    const GB_cartridge_t *cart = gb->cartridge_type;
+    if (cart->mbc_type == GB_HUC3 || cart->has_rtc) {
+        uint32_t limit = 0;
+        if (gb->rtc_mode == GB_RTC_MODE_SYNC_TO_HOST) {
+            limit = GB_get_unmultiplied_clock_rate(gb) / 16;
+        }
+        else if (cart->mbc_type == GB_HUC3 || !(gb->rtc_real.high & 0x40)) {
+            limit = unlikely(gb->rtc_second_length)? gb->rtc_second_length : GB_get_unmultiplied_clock_rate(gb) * 2;
+        }
+        if (limit) {
+            if (gb->rtc_cycles + units >= limit) return 0;
+            n = MIN(n, (limit - 1 - gb->rtc_cycles) / units);
+        }
+    }
+    return n >= 2? n : 0;
+}
+
+void GB_halt_lazy(GB_gameboy_t *gb, unsigned iterations)
+{
+    bool pre_cgb = !GB_is_cgb(gb);
+    GB_advance_cycles_chunked(gb, iterations * 4, pre_cgb? iterations * 2 : iterations);
+    gb->dma_cycles = pre_cgb? 2 : 4;
+}
 
 static void halt_batch_apply(GB_gameboy_t *gb, unsigned iterations)
 {

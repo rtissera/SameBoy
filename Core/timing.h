@@ -20,6 +20,10 @@ internal bool GB_lazy_cpu_allowed(GB_gameboy_t *gb);
 internal unsigned GB_lazy_cpu_budget(GB_gameboy_t *gb, unsigned max_lag);
 internal void GB_advance_cycles_chunked(GB_gameboy_t *gb, unsigned cycles, unsigned steps);
 internal void GB_halt_batch(GB_gameboy_t *gb, unsigned iterations);
+internal unsigned GB_halt_lazy_iterations(GB_gameboy_t *gb);
+internal void GB_halt_lazy(GB_gameboy_t *gb, unsigned iterations);
+/* Below this many HALT batch iterations, a pre-CGB run-ahead window (up to 32) is cheaper */
+#define GB_HALT_LAZY_MIN_BATCH 4
 internal void GB_emulate_timer_glitch(GB_gameboy_t *gb, uint8_t old_tac, uint8_t new_tac);
 internal bool GB_timing_sync_turbo(GB_gameboy_t *gb); /* Returns true if should skip frame */
 internal void GB_timing_sync(GB_gameboy_t *gb);

@@ -1706,6 +1706,15 @@ void GB_cpu_run(GB_gameboy_t *gb)
     if (gb->halted) {
         /* Skip a run of halted M-cycles that provably only advance counters (see timing.c) */
         unsigned iterations = GB_halt_batch_iterations(gb);
+        /* Relaxed accuracy, pre-CGB: run ahead across PPU/APU events when a HALT batch can't
+           go far (see GB_halt_lazy_iterations) */
+        if (unlikely(gb->lazy_cpu_enabled) && iterations < GB_HALT_LAZY_MIN_BATCH && !GB_is_cgb(gb)) {
+            unsigned lazy = GB_halt_lazy_iterations(gb);
+            if (lazy > iterations) {
+                GB_halt_lazy(gb, lazy);
+                iterations = 0;
+            }
+        }
         if (iterations) {
             GB_halt_batch(gb, iterations);
         }
