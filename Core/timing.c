@@ -749,7 +749,7 @@ static unsigned event_budget(GB_gameboy_t *gb, bool halted)
     /* GB_timing_sync runs every iteration in this state; it must keep returning early */
     if ((gb->interrupt_enable & 0x10) && (gb->ime || halted)) {
         if (gb->cycles_since_last_sync + units >= LCDC_PERIOD / 3) return 0;
-        n = MIN(n, (unsigned)((LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units));
+        n = MIN(n, (uint32_t)(LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units); /* fits: checked above; avoids a 64-bit division on 32-bit targets */
         if (!n) return 0;
     }
     
@@ -1029,7 +1029,7 @@ unsigned GB_halt_lazy_iterations(GB_gameboy_t *gb)
     const unsigned units = gb->cgb_double_speed? 4 : 8;
     if (gb->interrupt_enable & 0x10) {
         if (gb->cycles_since_last_sync + units >= LCDC_PERIOD / 3) return 0;
-        n = MIN(n, (unsigned)((LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units));
+        n = MIN(n, (uint32_t)(LCDC_PERIOD / 3 - 1 - gb->cycles_since_last_sync) / units); /* fits: checked above; avoids a 64-bit division on 32-bit targets */
     }
     const GB_cartridge_t *cart = gb->cartridge_type;
     if (cart->mbc_type == GB_HUC3 || cart->has_rtc) {

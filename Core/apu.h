@@ -239,6 +239,8 @@ typedef struct {
     /* Relaxed mode: the wave channel's mixer level is the mean of its pattern (ultrasonic tone,
        see wave_run_ultrasonic), not its current sample */
     bool wave_mean;
+    /* Same for the square channels (bit per channel), see square_run_ultrasonic */
+    uint8_t square_mean;
     uint16_t wave_ultrasonic_limit;
 
     GB_highpass_mode_t highpass_mode;

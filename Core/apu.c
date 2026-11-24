@@ -307,6 +307,22 @@ static inline void emit_update(GB_gameboy_t *gb, GB_channel_t index, const GB_sa
     }
 }
 
+/* Relaxed mode: a channel whose mixer level is its tone's mean (see wave_run_ultrasonic,
+   square_run_ultrasonic) keeps emit_pending set, so that any other level update (channel
+   stopped, DAC or APU off...) reaches the mixer even when the current sample is unchanged.
+   Such an update leaves the mean output; the next ultrasonic step re-enters it. */
+static bool leave_mean_output(GB_gameboy_t *gb, GB_channel_t index)
+{
+    if (index == GB_WAVE) {
+        if (!gb->apu_output.wave_mean) return false;
+        gb->apu_output.wave_mean = false;
+        return true;
+    }
+    if (!(gb->apu_output.square_mean & (1 << index))) return false;
+    gb->apu_output.square_mean &= ~(1 << index);
+    return true;
+}
+
 static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t value, unsigned cycles_offset, bool force_update)
 {
     if (gb->model > GB_MODEL_CGB_E) {
@@ -345,6 +361,9 @@ static void update_sample_internal(GB_gameboy_t *gb, GB_channel_t index, int8_t 
         return;
     }
     
+    if (unlikely(gb->apu_output.emit_pending[index]) && leave_mean_output(gb, index)) {
+        force_update = true;
+    }
     if (!force_update && value == 0 && gb->apu.samples[index] == 0) return;
     
     if (!GB_apu_is_DAC_enabled(gb, index)) {
@@ -635,6 +654,8 @@ static void render(GB_gameboy_t *gb)
     render_process(gb, &job);
 }
 
+static void square_emit_mean(GB_gameboy_t *gb, GB_channel_t index, unsigned cycles_offset);
+
 static void update_square_sample(GB_gameboy_t *gb, GB_channel_t index, unsigned cycles)
 {
     if (gb->apu.square_channels[index].sample_surpressed) {
@@ -651,6 +672,14 @@ static void update_square_sample(GB_gameboy_t *gb, GB_channel_t index, unsigned 
        assumed shared by all pre-CGB models. */
     bool output = !GB_is_cgb(gb) ? gb->apu.square_duty_output[index] :
                   duties[gb->apu.square_channels[index].current_sample_index + duty * 8];
+    if (unlikely(gb->apu_output.square_mean & (1 << index)) && gb->apu.is_active[index]) {
+        /* Relaxed mode, ultrasonic tone: the mixer gets the duty cycle's mean level */
+        if (GB_apu_is_DAC_enabled(gb, index)) {
+            gb->apu.samples[index] = output? gb->apu.square_channels[index].current_volume : 0;
+        }
+        square_emit_mean(gb, index, cycles);
+        return;
+    }
     update_sample(gb, index,
                   output?
                   gb->apu.square_channels[index].current_volume : 0,
@@ -748,8 +777,95 @@ static noinline void wave_run_ultrasonic(GB_gameboy_t *gb, unsigned cycles)
         output.right = (level * (signed)right_volume + (level >= 0? 16 : -16)) / 32;
     }
     gb->apu_output.wave_mean = true;
-    gb->apu_output.emit_pending[GB_WAVE] = false;
+    gb->apu_output.emit_pending[GB_WAVE] = true;
     emit_update(gb, GB_WAVE, &output, offset);
+}
+
+/* Relaxed accuracy (lazy CPU mode): a square channel parked at (or near) its maximum frequency
+   (a ~131 kHz tone at 0x7FF, used by some games to keep a channel quiet) steps up to a million
+   times per second, and every level change costs a band-limited step, while the band-limited
+   output only keeps the duty cycle's mean. Same approach as wave_run_ultrasonic: advance the
+   duty position arithmetically and feed the mean; the state the CPU can observe (duty position,
+   countdown, PCM12 level and glitch mask) stays exact. The square steps every 2 * (period)
+   ticks over 8 steps, so its tone is twice the wave's at the same period: limit is doubled. */
+static inline bool square_is_ultrasonic(GB_gameboy_t *gb, GB_channel_t index)
+{
+    return unlikely(gb->lazy_cpu_enabled) &&
+           unlikely((gb->apu.square_channels[index].sample_length ^ 0x7FF) < 2 * gb->apu_output.wave_ultrasonic_limit) &&
+           gb->model <= GB_MODEL_CGB_E;
+}
+
+static void square_emit_mean(GB_gameboy_t *gb, GB_channel_t index, unsigned cycles_offset)
+{
+    gb->apu_output.square_mean |= 1 << index;
+    gb->apu_output.emit_pending[index] = true;
+    if (!gb->apu_output.sample_rate) return;
+    uint8_t duty = gb->io_registers[index == GB_SQUARE_1? GB_IO_NR11 :GB_IO_NR21] >> 6;
+    unsigned high = inline_const(uint8_t[], {1, 2, 4, 6})[duty];
+    unsigned right_volume = 0;
+    if (gb->io_registers[GB_IO_NR51] & (1 << index)) {
+        right_volume = (gb->io_registers[GB_IO_NR50] & 7) + 1;
+    }
+    unsigned left_volume = 0;
+    if (gb->io_registers[GB_IO_NR51] & (0x10 << index)) {
+        left_volume = ((gb->io_registers[GB_IO_NR50] >> 4) & 7) + 1;
+    }
+    GB_sample_t output = {0, 0};
+    if (likely(!gb->apu_output.channel_muted[index])) {
+        /* Mean of (0xF - 2 * value) over the 8 duty steps, rounded */
+        signed level = 0xF * 8 - 2 * (signed)gb->apu.square_channels[index].current_volume * (signed)high;
+        output.left = (level * (signed)left_volume + (level >= 0? 4 : -4)) / 8;
+        output.right = (level * (signed)right_volume + (level >= 0? 4 : -4)) / 8;
+    }
+    emit_update(gb, index, &output, cycles_offset);
+}
+
+static noinline void square_run_ultrasonic(GB_gameboy_t *gb, GB_channel_t i, unsigned cycles)
+{
+    unsigned period = (gb->apu.square_channels[i].sample_length ^ 0x7FF) * 2 + 2;
+    unsigned countdown = gb->apu.square_channels[i].sample_countdown;
+    uint8_t duty = gb->io_registers[i == GB_SQUARE_1? GB_IO_NR11 :GB_IO_NR21] >> 6;
+    bool stepped = cycles > countdown;
+    if (stepped) {
+        unsigned left = cycles - countdown - 1;
+        unsigned steps = 1 + left / period;
+        unsigned rem = left % period;
+        unsigned old_index = gb->apu.square_channels[i].current_sample_index;
+        unsigned index = (old_index + steps) & 7;
+        if (rem == 0) {
+            /* The last step ends the run: the stepping loop's PCM12 glitch check, against the
+               level the channel had before that step */
+            int8_t previous = gb->apu.samples[i];
+            if (steps >= 2 && gb->apu.is_active[i] && GB_apu_is_DAC_enabled(gb, i)) {
+                previous = duties[((index - 1) & 7) + duty * 8]? gb->apu.square_channels[i].current_volume : 0;
+            }
+            if (previous == 0) {
+                gb->apu.pcm_mask[0] &= i == GB_SQUARE_1? 0xF0 : 0x0F;
+            }
+        }
+        uint8_t edge_sample_index = inline_const(uint8_t[], {7, 7, 5, 1})[duty];
+        if (steps >= 8 || ((edge_sample_index - old_index - 1) & 7) < steps) {
+            gb->apu_output.edge_triggered[i] = true;
+        }
+        gb->apu.square_channels[i].current_sample_index = index;
+        gb->apu.square_duty_output[i] = duties[index + duty * 8];
+        gb->apu.square_channels[i].sample_surpressed = false;
+        gb->apu.square_channels[i].did_tick = true;
+        gb->apu.square_channels[i].sample_countdown = period - 1 - rem;
+        gb->apu.square_channels[i].just_reloaded = rem == 0;
+    }
+    else {
+        gb->apu.square_channels[i].just_reloaded = cycles == 0;
+        gb->apu.square_channels[i].sample_countdown -= cycles;
+    }
+    
+    if (!gb->apu.is_active[i]) return;
+    /* Until its first step, the channel holds its current level, as stepping would */
+    if (!stepped && !(gb->apu_output.square_mean & (1 << i))) return;
+    if (GB_apu_is_DAC_enabled(gb, i)) {
+        gb->apu.samples[i] = gb->apu.square_duty_output[i]? gb->apu.square_channels[i].current_volume : 0;
+    }
+    square_emit_mean(gb, i, (gb->apu_output.square_mean & (1 << i))? 0 : countdown + 1);
 }
 
 static inline void set_envelope_clock(GB_envelope_clock_t *clock, bool value, bool direction, uint8_t volume)
@@ -1331,6 +1447,11 @@ restart:;
         }
 
         unrolled for (unsigned i = GB_SQUARE_1; i <= GB_SQUARE_2; i++) {
+            if (unlikely(gb->apu_output.square_mean & (1 << i)) && !(gb->apu.is_active[i] && square_is_ultrasonic(gb, i))) {
+                /* Back to per-step output: re-emit the channel's real level */
+                gb->apu_output.square_mean &= ~(1 << i);
+                update_sample_internal(gb, i, gb->apu.samples[i], 0, true);
+            }
             /* On pre-CGB models, length/sweep expiry gates output, not the frequency
                clock. GEXU/BUTA keep the duty sequencer running until DAC off.
                TODO: only measured on one DMG (CPU revision unconfirmed);
@@ -1344,6 +1465,10 @@ restart:;
                     else {
                         gb->apu.square_channels[i].delay -= cycles_left;
                     }
+                }
+                if (unlikely(cycles_left > gb->apu.square_channels[i].sample_countdown) && square_is_ultrasonic(gb, i)) {
+                    square_run_ultrasonic(gb, i, cycles_left);
+                    continue;
                 }
                 while (unlikely(cycles_left > gb->apu.square_channels[i].sample_countdown)) {
                     cycles_left -= gb->apu.square_channels[i].sample_countdown + 1;
@@ -1400,6 +1525,20 @@ restart:;
             if (cycles_left) {
                 gb->apu.wave_channel.sample_countdown -= cycles_left;
                 gb->apu.wave_channel.wave_form_just_read = false;
+            }
+        }
+        else if (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && gb->model <= GB_MODEL_CGB_E &&
+                 gb->lazy_cpu_enabled) {
+            /* Relaxed mode: every step of the run reads the same bus value, only the last
+               read and the countdown matter */
+            if (cycles > gb->apu.wave_channel.sample_countdown) {
+                unsigned period = (gb->apu.wave_channel.sample_length ^ 0x7FF) + 1;
+                unsigned rem = (cycles - gb->apu.wave_channel.sample_countdown - 1) % period;
+                gb->apu.wave_channel.sample_countdown = period - 1 - rem;
+                gb->apu.wave_channel.current_sample_byte = read_wave_sample_bus(gb);
+            }
+            else {
+                gb->apu.wave_channel.sample_countdown -= cycles;
             }
         }
         else if (gb->apu.wave_channel.enable && gb->apu.wave_channel.pulsed && gb->model <= GB_MODEL_CGB_E) {
