@@ -236,6 +236,10 @@ typedef struct {
     /* The next update of the channel must reach update_sample_internal even if its level is
        unchanged (set when the mixer output may be stale: init, state load, sample rate, mute) */
     bool emit_pending[GB_N_CHANNELS];
+    /* Relaxed mode: the wave channel's mixer level is the mean of its pattern (ultrasonic tone,
+       see wave_run_ultrasonic), not its current sample */
+    bool wave_mean;
+    uint16_t wave_ultrasonic_limit;
 
     GB_highpass_mode_t highpass_mode;
     double highpass_rate;

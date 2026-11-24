@@ -671,6 +671,87 @@ static inline void update_wave_sample(GB_gameboy_t *gb, unsigned cycles)
     }
 }
 
+/* Relaxed accuracy (lazy CPU mode): a wave channel playing far above the output Nyquist
+   frequency (typically parked at the maximum frequency to keep it quiet) steps up to ~2 million
+   times per second, and every level change costs a band-limited step, while the band-limited
+   output only keeps the pattern's mean. Advance the channel arithmetically and feed the mean.
+   The channel state the CPU can observe (position, sample byte, PCM register) stays exact. */
+/* Tone (2 MiHz APU ticks, 32 steps per period) at least 0.6x the output rate, well inside the
+   band-limited filter's stop band: (sample_length ^ 0x7FF) < wave_ultrasonic_limit */
+static void update_wave_ultrasonic_limit(GB_gameboy_t *gb)
+{
+    unsigned rate = gb->apu_output.sample_rate;
+    if (!rate || gb->apu_output.max_cycles_per_sample == 1) {
+        gb->apu_output.wave_ultrasonic_limit = 0;
+        return;
+    }
+    gb->apu_output.wave_ultrasonic_limit = MIN((uint64_t)2097152 * 10 / ((uint64_t)6 * 32 * rate), 0x800);
+}
+
+static inline bool wave_is_ultrasonic(GB_gameboy_t *gb)
+{
+    return unlikely(gb->lazy_cpu_enabled) &&
+           unlikely((gb->apu.wave_channel.sample_length ^ 0x7FF) < gb->apu_output.wave_ultrasonic_limit) &&
+           gb->model <= GB_MODEL_CGB_E;
+}
+
+static noinline void wave_run_ultrasonic(GB_gameboy_t *gb, unsigned cycles)
+{
+    unsigned period = (gb->apu.wave_channel.sample_length ^ 0x7FF) + 1;
+    unsigned countdown = gb->apu.wave_channel.sample_countdown;
+    bool stepped = cycles > countdown;
+    if (stepped) {
+        unsigned left = cycles - countdown - 1;
+        unsigned steps = 1 + left / period;
+        unsigned rem = left % period;
+        unsigned index = gb->apu.wave_channel.current_sample_index;
+        if (index + steps >= 32) {
+            gb->apu_output.edge_triggered[GB_WAVE] = true;
+        }
+        index = (index + steps) & 0x1F;
+        gb->apu.wave_channel.current_sample_index = index;
+        gb->apu.wave_channel.current_sample_byte = gb->io_registers[GB_IO_WAV_START + (index >> 1)];
+        gb->apu.wave_channel.sample_countdown = period - 1 - rem;
+        gb->apu.wave_channel.wave_form_just_read = rem == 0;
+    }
+    else if (cycles) {
+        gb->apu.wave_channel.sample_countdown -= cycles;
+        gb->apu.wave_channel.wave_form_just_read = false;
+    }
+    
+    /* Until its first step with the short period (the countdown loaded by a trigger may still
+       be long), the channel holds its current sample, as stepping would */
+    if (!stepped && !gb->apu_output.wave_mean) return;
+    uint8_t byte = gb->apu.wave_channel.current_sample_byte;
+    uint8_t shift = gb->apu.wave_channel.shift;
+    gb->apu.samples[GB_WAVE] = ((gb->apu.wave_channel.current_sample_index & 1)? (byte & 0xF) : (byte >> 4)) >> shift;
+    if (!gb->apu_output.sample_rate) return;
+    unsigned offset = gb->apu_output.wave_mean? 0 : countdown + 1;
+    unsigned sum = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        uint8_t b = gb->io_registers[GB_IO_WAV_START + i];
+        sum += ((b >> 4) >> shift) + ((b & 0xF) >> shift);
+    }
+    unsigned right_volume = 0;
+    if (gb->io_registers[GB_IO_NR51] & (1 << GB_WAVE)) {
+        right_volume = (gb->io_registers[GB_IO_NR50] & 7) + 1;
+    }
+    unsigned left_volume = 0;
+    if (gb->io_registers[GB_IO_NR51] & (0x10 << GB_WAVE)) {
+        left_volume = ((gb->io_registers[GB_IO_NR50] >> 4) & 7) + 1;
+    }
+    GB_sample_t output = {0, 0};
+    if (likely(!gb->apu_output.channel_muted[GB_WAVE])) {
+        /* Mean of (0xF - 2 * value) over the 32 samples, rounded */
+        signed level = 0xF * 32 - 2 * (signed)sum;
+        output.left = (level * (signed)left_volume + (level >= 0? 16 : -16)) / 32;
+        output.right = (level * (signed)right_volume + (level >= 0? 16 : -16)) / 32;
+    }
+    gb->apu_output.wave_mean = true;
+    gb->apu_output.emit_pending[GB_WAVE] = false;
+    emit_update(gb, GB_WAVE, &output, offset);
+}
+
 static inline void set_envelope_clock(GB_envelope_clock_t *clock, bool value, bool direction, uint8_t volume)
 {
     if (clock->clock == value) return;
@@ -1293,7 +1374,15 @@ restart:;
         }
 
         gb->apu.wave_channel.wave_form_just_read = false;
-        if (gb->apu.is_active[GB_WAVE]) {
+        if (unlikely(gb->apu_output.wave_mean) && !(gb->apu.is_active[GB_WAVE] && wave_is_ultrasonic(gb))) {
+            /* Back to per-step output: re-emit the channel's real level */
+            gb->apu_output.wave_mean = false;
+            update_sample_internal(gb, GB_WAVE, gb->apu.samples[GB_WAVE], 0, true);
+        }
+        if (gb->apu.is_active[GB_WAVE] && wave_is_ultrasonic(gb)) {
+            wave_run_ultrasonic(gb, cycles);
+        }
+        else if (gb->apu.is_active[GB_WAVE]) {
             uint16_t cycles_left = cycles;
             while (unlikely(cycles_left > gb->apu.wave_channel.sample_countdown)) {
                 cycles_left -= gb->apu.wave_channel.sample_countdown + 1;
@@ -2549,6 +2638,7 @@ void GB_set_sample_rate(GB_gameboy_t *gb, unsigned sample_rate)
     else {
         gb->apu_output.max_cycles_per_sample = 0x400;
     }
+    update_wave_ultrasonic_limit(gb);
 }
 
 void GB_set_sample_rate_by_clocks(GB_gameboy_t *gb, double cycles_per_sample)
@@ -2563,6 +2653,7 @@ void GB_set_sample_rate_by_clocks(GB_gameboy_t *gb, double cycles_per_sample)
     GB_apu_invalidate_levels(gb);
     gb->apu_output.highpass_rate = pow(0.999958, cycles_per_sample);
     gb->apu_output.max_cycles_per_sample = ceil(cycles_per_sample / 4);
+    update_wave_ultrasonic_limit(gb);
     
     gb->apu_output.quick_fraction_multiply_cache[0] = round(gb->apu_output.sample_rate * 2.0 / GB_get_clock_rate(gb) * (1 << 28));
     for (unsigned i = 1; i < GB_QUICK_MULTIPLY_COUNT; i++) {
